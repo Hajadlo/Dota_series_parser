@@ -1,0 +1,9 @@
+*.dem
+debug/
+replays/
+analysis/
+__pycache__/
+.venv/
+.env
+.vscode/
+.gitnexus
