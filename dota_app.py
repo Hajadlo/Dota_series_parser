@@ -333,11 +333,11 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
 
 def analyse_special_events(events: list[dict]) -> dict:
     """
-    Scan sorted events for first tower death, first barracks death, and first Roshan kill (Aegis proxy).
+    Scan sorted events for first tower death, first barracks death, and first Aegis pickup.
 
     First Tower    — credited to the team that did NOT lose the tower.
     First Barracks — credited to the team that did NOT lose the barracks.
-    First Aegis    — credited to the team whose hero killed Roshan first.
+    First Aegis    — credited to the team whose hero picked up the Aegis.
 
     Returns {"first_tower": event | None, "first_barracks": event | None, "first_aegis": event | None}.
     """
@@ -355,7 +355,7 @@ def analyse_special_events(events: list[dict]) -> dict:
             lost = e.get("lost_team", 0)
             got = 3 if lost == 2 else (2 if lost == 3 else 0)
             first_barracks = {**e, "got_team": got, "is_radiant": got == 2}
-        if first_aegis is None and etype == "roshan":
+        if first_aegis is None and etype == "aegis":
             kt = e.get("killer_team", 0)
             first_aegis = {**e, "is_radiant": kt == 2}
         if first_tower is not None and first_barracks is not None and first_aegis is not None:
@@ -599,6 +599,7 @@ def render_match_analysis(data: dict) -> None:
             barracks_set: set[int] = set()
             roshan_set: set[int] = set()
             tormentor_set: set[int] = set()
+            aegis_set: set[int] = set()
             _total = 0
             for _i, _k in enumerate(raw_kills):
                 etype = _k.get("type")
@@ -613,6 +614,9 @@ def render_match_analysis(data: dict) -> None:
                     continue
                 if etype == "tormentor":
                     tormentor_set.add(_i)
+                    continue
+                if etype == "aegis":
+                    aegis_set.add(_i)
                     continue
                 if _k.get("is_deny"):
                     deny_set.add(_i)
@@ -633,6 +637,7 @@ def render_match_analysis(data: dict) -> None:
                 is_barracks = i in barracks_set
                 is_roshan = i in roshan_set
                 is_tormentor = i in tormentor_set
+                is_aegis = i in aegis_set
                 is_counted = i in counted_set
                 if is_counted:
                     _seq += 1
@@ -650,6 +655,8 @@ def render_match_analysis(data: dict) -> None:
                     credited = f"{_team_label(kt)} (roshan)"
                 elif is_tormentor:
                     credited = f"{_team_label(kt)} (tormentor)"
+                elif is_aegis:
+                    credited = f"{_team_label(kt)} (aegis)"
                 elif is_deny:
                     credited = "deny"
                 elif kt in (2, 3):
@@ -664,6 +671,7 @@ def render_match_analysis(data: dict) -> None:
                     "BARRACKS" if is_barracks else
                     "ROSHAN" if is_roshan else
                     "TORMENTOR" if is_tormentor else
+                    "AEGIS" if is_aegis else
                     "DROPPED"
                 )
 

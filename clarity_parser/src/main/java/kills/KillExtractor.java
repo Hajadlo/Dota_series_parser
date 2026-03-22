@@ -36,6 +36,22 @@ public class KillExtractor {
             return;
         }
 
+        // === Aegis pickup ===
+        // DOTA_COMBATLOG_AEGIS_TAKEN fires when a hero picks up the Aegis of the Immortal.
+        if (cle.getType() == DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_AEGIS_TAKEN) {
+            String heroName = cle.getTargetName();
+            if (heroName == null) heroName = "";
+            int team = cle.getTargetTeam();
+            float gameTime = cle.getTimestamp() - gameStartTime;
+            if (team == 2 || team == 3) {
+                out.println(String.format(
+                    "{\"type\":\"aegis\",\"killer_team\":%d,\"target\":\"%s\",\"time\":%d,\"time_f\":%.3f}",
+                    team, heroName, Math.round(gameTime), gameTime
+                ));
+            }
+            return;
+        }
+
         if (cle.getType() != DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_DEATH) {
             return;
         }
