@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import requests
 import streamlit as st
@@ -344,26 +345,6 @@ def process_match(match_id: str) -> dict:
     dire_score    = int(match.get("dire_score", 0))
     duration      = int(match.get("duration", 0))
 
-    # Parse objectives for Roshan kills (and Tormentor, commented out for now)
-    roshan_kills = {"radiant": 0, "dire": 0}
-    tormentor_first_team: int | None = None
-    # tormentor_kills = {"radiant": 0, "dire": 0}
-    for obj in (match.get("objectives") or []):
-        t    = obj.get("type", "")
-        team = obj.get("team")
-        if t == "CHAT_MESSAGE_ROSHAN_KILL":
-            if team == 2:
-                roshan_kills["radiant"] += 1
-            elif team == 3:
-                roshan_kills["dire"] += 1
-        elif t == "CHAT_MESSAGE_MINIBOSS_KILL":
-            if tormentor_first_team is None and team in (2, 3):
-                tormentor_first_team = team
-            # if team == 2:
-            #     tormentor_kills["radiant"] += 1
-            # elif team == 3:
-            #     tormentor_kills["dire"] += 1
-
     def _basic_info(replay_err: str | None = None) -> dict:
         return {
             "match_id": match_id,
@@ -378,8 +359,6 @@ def process_match(match_id: str) -> dict:
             "radiant_score": radiant_score,
             "dire_score": dire_score,
             "duration": duration,
-            "roshan_kills": roshan_kills,
-            "tormentor_first_team": tormentor_first_team,
         }
 
     replay_url = match.get("replay_url")
@@ -409,9 +388,6 @@ def process_match(match_id: str) -> dict:
         "raw_kills": kills,
         "total_expected_kills": radiant_score + dire_score,
         "duration": duration,
-        "roshan_kills": roshan_kills,
-        "tormentor_first_team": tormentor_first_team,
-        # "tormentor_kills": tormentor_kills,
     }
 
 
@@ -465,39 +441,8 @@ def render_match_analysis(data: dict) -> None:
     if duration_secs:
         st.markdown(f"Duration: **{duration_secs // 60}:{duration_secs % 60:02d}**")
 
-    rosh = data.get("roshan_kills", {"radiant": 0, "dire": 0})
-    rosh_total = rosh["radiant"] + rosh["dire"]
-    torm_first = data.get("tormentor_first_team")
-    if torm_first == 2:
-        torm_first_label = f"<span style='color:{RADIANT_COLOR}'>{rn}</span>"
-    elif torm_first == 3:
-        torm_first_label = f"<span style='color:{DIRE_COLOR}'>{dn}</span>"
-    else:
-        torm_first_label = "N/A"
-    st.markdown(
-        f"Roshan kills: "
-        f"<span style='color:{RADIANT_COLOR}'>{rn} {rosh['radiant']}</span> — "
-        f"<span style='color:{DIRE_COLOR}'>{dn} {rosh['dire']}</span> "
-        f"({rosh_total} total) &nbsp;|&nbsp; "
-        f"1st Tormentor: {torm_first_label}",
-        unsafe_allow_html=True,
-    )
-    # torm = data.get("tormentor_kills", {"radiant": 0, "dire": 0})
-    # torm_total = torm["radiant"] + torm["dire"]
-    # st.markdown(
-    #     f"Tormentor kills: "
-    #     f"<span style='color:{RADIANT_COLOR}'>{rn} {torm['radiant']}</span> — "
-    #     f"<span style='color:{DIRE_COLOR}'>{dn} {torm['die']}</span> "
-    #     f"({torm_total} total)",
-    #     unsafe_allow_html=True,
-    # )
-
     if not replay_available:
-        replay_err = data.get("replay_error")
-        if replay_err:
-            st.warning(f"Replay download failed — kill milestones unavailable. ({replay_err})")
-        else:
-            st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
+        st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
         return
 
     st.divider()
@@ -678,3 +623,18 @@ if st.session_state.series_matches is not None:
 
 if st.session_state.match_analysis is not None:
     render_match_analysis(st.session_state.match_analysis)
+
+    # Auto-retry every minute until the replay is available
+    if not st.session_state.match_analysis.get("replay_available", True):
+        match_id = st.session_state.match_analysis["match_id"]
+        status = st.empty()
+        for remaining in range(60, 0, -1):
+            status.info(f"Retrying replay download in {remaining}s... ⏳")
+            time.sleep(1)
+        status.info("Attempting to download replay... 🔄")
+        try:
+            new_data = process_match(match_id)
+            st.session_state.match_analysis = new_data
+        except Exception:
+            pass
+        st.rerun()
