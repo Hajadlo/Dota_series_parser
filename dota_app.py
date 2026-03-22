@@ -333,17 +333,17 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
 
 def analyse_special_events(events: list[dict]) -> dict:
     """
-    Scan sorted events for first tower death, first barracks death, and first Aegis pickup.
+    Scan sorted events for first tower death, first barracks death, and first Roshan kill.
 
     First Tower    — credited to the team that did NOT lose the tower.
     First Barracks — credited to the team that did NOT lose the barracks.
-    First Aegis    — credited to the team whose hero picked up the Aegis.
+    First Roshan   — credited to the team that killed Roshan (and thus picked up the Aegis).
 
-    Returns {"first_tower": event | None, "first_barracks": event | None, "first_aegis": event | None}.
+    Returns {"first_tower": event | None, "first_barracks": event | None, "first_roshan": event | None}.
     """
     first_tower: dict | None = None
     first_barracks: dict | None = None
-    first_aegis: dict | None = None
+    first_roshan: dict | None = None
 
     for e in events:
         etype = e.get("type")
@@ -355,13 +355,13 @@ def analyse_special_events(events: list[dict]) -> dict:
             lost = e.get("lost_team", 0)
             got = 3 if lost == 2 else (2 if lost == 3 else 0)
             first_barracks = {**e, "got_team": got, "is_radiant": got == 2}
-        if first_aegis is None and etype == "aegis":
+        if first_roshan is None and etype == "roshan":
             kt = e.get("killer_team", 0)
-            first_aegis = {**e, "is_radiant": kt == 2}
-        if first_tower is not None and first_barracks is not None and first_aegis is not None:
+            first_roshan = {**e, "is_radiant": kt == 2}
+        if first_tower is not None and first_barracks is not None and first_roshan is not None:
             break
 
-    return {"first_tower": first_tower, "first_barracks": first_barracks, "first_aegis": first_aegis}
+    return {"first_tower": first_tower, "first_barracks": first_barracks, "first_roshan": first_roshan}
 
 
 # ── Full match pipeline ────────────────────────────────────────────────────────
@@ -435,7 +435,7 @@ def process_match(match_id: str) -> dict:
     special = analyse_special_events(kills)
     milestones["first_tower"] = special["first_tower"]
     milestones["first_barracks"] = special["first_barracks"]
-    milestones["first_aegis"] = special["first_aegis"]
+    milestones["first_roshan"] = special["first_roshan"]
 
     return {
         "match_id": match_id,
@@ -529,7 +529,7 @@ def render_match_analysis(data: dict) -> None:
         )
     with c4:
         st.markdown(
-            f"**First Aegis:** {result_label(m.get('first_aegis'), rn, dn)}",
+            f"**First Roshan:** {result_label(m.get('first_roshan'), rn, dn)} (DOUBLE CHECK PLS)",
             unsafe_allow_html=True,
         )
     with c5:
