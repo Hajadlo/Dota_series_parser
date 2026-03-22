@@ -522,7 +522,7 @@ def render_match_analysis(data: dict) -> None:
         )
     with c4:
         st.markdown(
-            f"**1st Tormentor:** {result_label(torm_event, rn, dn)}",
+            f"**First Tormentor:** {result_label(torm_event, rn, dn)}",
             unsafe_allow_html=True,
         )
 
