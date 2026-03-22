@@ -598,6 +598,7 @@ def render_match_analysis(data: dict) -> None:
             tower_set: set[int] = set()
             barracks_set: set[int] = set()
             roshan_set: set[int] = set()
+            tormentor_set: set[int] = set()
             _total = 0
             for _i, _k in enumerate(raw_kills):
                 etype = _k.get("type")
@@ -609,6 +610,9 @@ def render_match_analysis(data: dict) -> None:
                     continue
                 if etype == "roshan":
                     roshan_set.add(_i)
+                    continue
+                if etype == "tormentor":
+                    tormentor_set.add(_i)
                     continue
                 if _k.get("is_deny"):
                     deny_set.add(_i)
@@ -628,6 +632,7 @@ def render_match_analysis(data: dict) -> None:
                 is_tower = i in tower_set
                 is_barracks = i in barracks_set
                 is_roshan = i in roshan_set
+                is_tormentor = i in tormentor_set
                 is_counted = i in counted_set
                 if is_counted:
                     _seq += 1
@@ -643,6 +648,8 @@ def render_match_analysis(data: dict) -> None:
                     credited = f"{_team_label(got)} (barracks)"
                 elif is_roshan:
                     credited = f"{_team_label(kt)} (roshan)"
+                elif is_tormentor:
+                    credited = f"{_team_label(kt)} (tormentor)"
                 elif is_deny:
                     credited = "deny"
                 elif kt in (2, 3):
@@ -656,6 +663,7 @@ def render_match_analysis(data: dict) -> None:
                     "TOWER" if is_tower else
                     "BARRACKS" if is_barracks else
                     "ROSHAN" if is_roshan else
+                    "TORMENTOR" if is_tormentor else
                     "DROPPED"
                 )
 

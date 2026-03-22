@@ -14,19 +14,35 @@ public class KillExtractor {
 
     private final PrintWriter out;
 
+    // Pre-game offset: the raw timestamp when game state transitions to 5
+    // (in-game clock = 0:00, creeps spawn). Subtracted from all event timestamps.
+    private float gameStartTime = 0.0f;
+
     public KillExtractor() {
         this.out = new PrintWriter(new OutputStreamWriter(System.out, StandardCharsets.UTF_8), true);
     }
 
     @OnCombatLogEntry
     public void onCombatLogEntry(CombatLogEntry cle) throws Exception {
+
+        // === Detect game start (state 5) to capture pre-game offset ===
+        // DOTA_COMBATLOG_GAME_STATE with value 5 = game officially begins.
+        // cle.getTimestamp() at this moment is the raw pre-game duration
+        // (draft + strategy + countdown). We subtract it from all kill times.
+        if (cle.getType() == DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_GAME_STATE) {
+            if (cle.getValue() == 5) {
+                gameStartTime = cle.getTimestamp();
+            }
+            return;
+        }
+
         if (cle.getType() != DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_DEATH) {
             return;
         }
 
         String targetName = cle.getTargetName();
         if (targetName == null) targetName = "";
-        float gameTime = cle.getTimestamp();
+        float gameTime = cle.getTimestamp() - gameStartTime;
 
         // === Tower deaths ===
         // Radiant towers: npc_dota_goodguys_tower* → lost_team=2 (Radiant lost it)
@@ -62,6 +78,19 @@ public class KillExtractor {
             if (killerTeam == 2 || killerTeam == 3) {
                 out.println(String.format(
                     "{\"type\":\"roshan\",\"killer_team\":%d,\"target\":\"%s\",\"time\":%d,\"time_f\":%.3f}",
+                    killerTeam, targetName, Math.round(gameTime), gameTime
+                ));
+            }
+            return;
+        }
+
+        // === Tormentor kill ===
+        // npc_dota_miniboss is the tormentor NPC.
+        if (targetName.contains("miniboss")) {
+            int killerTeam = cle.getAttackerTeam();
+            if (killerTeam == 2 || killerTeam == 3) {
+                out.println(String.format(
+                    "{\"type\":\"tormentor\",\"killer_team\":%d,\"target\":\"%s\",\"time\":%d,\"time_f\":%.3f}",
                     killerTeam, targetName, Math.round(gameTime), gameTime
                 ));
             }
