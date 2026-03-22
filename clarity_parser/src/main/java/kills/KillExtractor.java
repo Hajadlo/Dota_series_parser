@@ -60,12 +60,26 @@ public class KillExtractor {
         if (targetTeam != 2 && targetTeam != 3) {
             return;
         }
-        int killerTeam = (targetTeam == 2) ? 3 : 2;
 
         float gameTime = cle.getTimestamp();
         String targetName = cle.getTargetName();
         String attackerName = cle.getAttackerName();
         if (attackerName == null) attackerName = "";
+
+        // Deny detection: attacker and target are on the same team.
+        // In Dota 2 a deny does NOT count as a kill for anyone — emit killer_team=0
+        // so the Python analyser skips it, while still preserving it in raw output
+        // for debug visibility (is_deny=true).
+        if (attackerTeam == targetTeam) {
+            String line = String.format(
+                "{\"killer_team\":0,\"is_deny\":true,\"target\":\"%s\",\"attacker\":\"%s\",\"attacker_team_raw\":%d,\"time\":%d,\"time_f\":%.3f}",
+                targetName, attackerName, cle.getAttackerTeam(), Math.round(gameTime), gameTime
+            );
+            out.println(line);
+            return;
+        }
+
+        int killerTeam = (targetTeam == 2) ? 3 : 2;
 
         String line = String.format(
             "{\"killer_team\":%d,\"target\":\"%s\",\"attacker\":\"%s\",\"attacker_team_raw\":%d,\"time\":%d,\"time_f\":%.3f}",

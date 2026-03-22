@@ -260,12 +260,15 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
     """
     kills: list of {"killer_team": int, "target": npc_name, "time": int, "time_f": float}
       killer_team: 2 = Radiant got the kill, 3 = Dire got the kill
+                   0 = deny (attacker and target on same team) — NOT counted as a kill
     total_expected_kills: radiant_score + dire_score from OpenDota (authoritative total).
         Clarity emits phantom DOTA_COMBATLOG_DEATH events after the ancient is destroyed;
         those always sort chronologically last.  We stop counting as soon as we hit the
         expected total so phantom events at the tail are never reached.
 
     Java uses getTargetTeam() flip: killer_team = 5 - targetTeam (2→3, 3→2).
+    Deny detection: when attackerTeam == targetTeam in Java, killer_team is set to 0
+    and is_deny=true is emitted. These events are skipped here (not credited to anyone).
     Filters: isTargetHero() (proto bool, no string-table) and !isTargetIllusion().
     This correctly counts all kill types — direct hero kills, summon kills (Spirit Bear,
     Warlock Golem, etc.), dominated-creep kills — because in every case the target hero
@@ -501,8 +504,12 @@ def render_match_analysis(data: dict) -> None:
 
             # Walk the list as analyse_kills() does to mark which were counted
             counted_set: set[int] = set()
+            deny_set: set[int] = set()
             _total = 0
             for _i, _k in enumerate(raw_kills):
+                if _k.get("is_deny"):
+                    deny_set.add(_i)
+                    continue
                 if _k.get("killer_team", 0) not in (2, 3):
                     continue
                 _total += 1
@@ -514,6 +521,7 @@ def render_match_analysis(data: dict) -> None:
             _seq = 0
             for i, k in enumerate(raw_kills):
                 kt = k.get("killer_team", 0)
+                is_deny = i in deny_set
                 is_counted = i in counted_set
                 if is_counted:
                     _seq += 1
@@ -524,8 +532,8 @@ def render_match_analysis(data: dict) -> None:
                     "target": _short(k.get("target", "")),
                     "attacker": _short(k.get("attacker", "")),
                     "att_team": _team_label(att_raw),
-                    "credited_to": _team_label(kt) if kt in (2, 3) else f"? ({kt})",
-                    "counted": "yes" if is_counted else "DROPPED",
+                    "credited_to": "deny" if is_deny else (_team_label(kt) if kt in (2, 3) else f"? ({kt})"),
+                    "counted": "yes" if is_counted else ("DENY" if is_deny else "DROPPED"),
                 })
 
             st.dataframe(rows, use_container_width=True)
