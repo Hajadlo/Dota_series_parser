@@ -6,7 +6,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 
 import requests
 import streamlit as st
@@ -180,30 +179,41 @@ def download_and_decompress_replay(replay_url: str, dest_path: str) -> None:
 
 
 def _find_java() -> str:
-    # 1. PATH
+    # 1. PATH (works on Linux, macOS, and Windows)
     found = shutil.which("java")
     if found:
         return found
     # 2. JAVA_HOME env var
     java_home = os.environ.get("JAVA_HOME", "")
     if java_home:
-        candidate = os.path.join(java_home, "bin", "java.exe")
-        if os.path.isfile(candidate):
-            return candidate
-    # 3. Common Windows install paths (newest version first)
-    patterns = [
+        for exe in ("bin/java", r"bin\java.exe"):
+            candidate = os.path.join(java_home, exe)
+            if os.path.isfile(candidate):
+                return candidate
+    # 3. Common Linux/macOS paths
+    linux_patterns = [
+        "/usr/lib/jvm/*/bin/java",
+        "/usr/local/lib/jvm/*/bin/java",
+        os.path.join(os.path.expanduser("~"), ".jdks", "*", "bin", "java"),
+    ]
+    for pattern in linux_patterns:
+        matches = sorted(glob.glob(pattern), reverse=True)
+        if matches:
+            return matches[0]
+    # 4. Common Windows install paths (newest version first)
+    windows_patterns = [
         os.path.join(os.path.expanduser("~"), ".jdks", "*", "bin", "java.exe"),
         r"C:\Program Files\Eclipse Adoptium\jdk*\bin\java.exe",
         r"C:\Program Files\Java\jdk*\bin\java.exe",
         r"C:\Program Files\Microsoft\jdk*\bin\java.exe",
         r"C:\Program Files\BellSoft\LibericaJDK*\bin\java.exe",
     ]
-    for pattern in patterns:
+    for pattern in windows_patterns:
         matches = sorted(glob.glob(pattern), reverse=True)
         if matches:
             return matches[0]
     raise FileNotFoundError(
-        "Could not find java.exe. Set the JAVA_HOME environment variable "
+        "Could not find java. Set the JAVA_HOME environment variable "
         "or add the JDK bin directory to PATH."
     )
 
@@ -314,27 +324,10 @@ def process_match(match_id: str) -> dict:
     """
     Fetch match data, download & parse replay, compute kill milestones.
     Returns everything needed for rendering.
+    If no replay is available yet, returns basic match info immediately
+    with replay_available=False and milestones=None.
     """
     match = fetch_match(match_id)
-
-    replay_url = match.get("replay_url")
-    if not replay_url:
-        status_placeholder = st.empty()
-        while not replay_url:
-            for remaining in range(60, 0, -1):
-                status_placeholder.info(f"Replay not available yet. Next check in {remaining} seconds... ⏳")
-                time.sleep(1)
-            
-            status_placeholder.info("Checking OpenDota for replay... 🔄")
-            try:
-                match = fetch_match_uncached(match_id)
-                replay_url = match.get("replay_url")
-                if replay_url:
-                    fetch_match.clear()
-                    break
-            except Exception:
-                pass
-        status_placeholder.empty()
 
     radiant_name = (
         (match.get("radiant_team") or {}).get("name")
@@ -347,17 +340,8 @@ def process_match(match_id: str) -> dict:
         or "Dire"
     )
 
-    # Download & decompress replay, parse kills
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dem_path = os.path.join(tmpdir, f"{match_id}.dem")
-        with st.spinner(f"Downloading replay (~110 MB)..."):
-            download_and_decompress_replay(replay_url, dem_path)
-        with st.spinner("Parsing replay for kill events..."):
-            kills = run_kill_extractor(dem_path)
-
     radiant_score = int(match.get("radiant_score", 0))
     dire_score    = int(match.get("dire_score", 0))
-    milestones = analyse_kills(kills, radiant_score + dire_score)
 
     # Parse objectives for Roshan kills (and Tormentor, commented out for now)
     roshan_kills = {"radiant": 0, "dire": 0}
@@ -379,11 +363,39 @@ def process_match(match_id: str) -> dict:
             # elif team == 3:
             #     tormentor_kills["dire"] += 1
 
+    replay_url = match.get("replay_url")
+    if not replay_url:
+        return {
+            "match_id": match_id,
+            "radiant_name": radiant_name,
+            "dire_name": dire_name,
+            "radiant_win": match.get("radiant_win", False),
+            "replay_available": False,
+            "milestones": None,
+            "raw_kills": [],
+            "total_expected_kills": radiant_score + dire_score,
+            "radiant_score": radiant_score,
+            "dire_score": dire_score,
+            "roshan_kills": roshan_kills,
+            "tormentor_first_team": tormentor_first_team,
+        }
+
+    # Download & decompress replay, parse kills
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dem_path = os.path.join(tmpdir, f"{match_id}.dem")
+        with st.spinner(f"Downloading replay (~110 MB)..."):
+            download_and_decompress_replay(replay_url, dem_path)
+        with st.spinner("Parsing replay for kill events..."):
+            kills = run_kill_extractor(dem_path)
+
+    milestones = analyse_kills(kills, radiant_score + dire_score)
+
     return {
         "match_id": match_id,
         "radiant_name": radiant_name,
         "dire_name": dire_name,
         "radiant_win": match.get("radiant_win", False),
+        "replay_available": True,
         "milestones": milestones,
         "raw_kills": kills,
         "total_expected_kills": radiant_score + dire_score,
@@ -400,6 +412,7 @@ def render_match_analysis(data: dict) -> None:
     dn = data["dire_name"]
     rw = data["radiant_win"]
     m = data["milestones"]
+    replay_available = data.get("replay_available", True)
 
     # Header
     st.divider()
@@ -418,14 +431,25 @@ def render_match_analysis(data: dict) -> None:
             unsafe_allow_html=True,
         )
 
-    total = m["total_kills"]
-    st.markdown(
-        f"Total kills: "
-        f"<span style='color:{RADIANT_COLOR}'>{rn} {m['radiant_kills']}</span> — "
-        f"<span style='color:{DIRE_COLOR}'>{dn} {m['dire_kills']}</span> "
-        f"({total} total)",
-        unsafe_allow_html=True,
-    )
+    if replay_available:
+        total = m["total_kills"]
+        st.markdown(
+            f"Total kills: "
+            f"<span style='color:{RADIANT_COLOR}'>{rn} {m['radiant_kills']}</span> — "
+            f"<span style='color:{DIRE_COLOR}'>{dn} {m['dire_kills']}</span> "
+            f"({total} total)",
+            unsafe_allow_html=True,
+        )
+    else:
+        rs = data.get("radiant_score", 0)
+        ds = data.get("dire_score", 0)
+        st.markdown(
+            f"Total kills: "
+            f"<span style='color:{RADIANT_COLOR}'>{rn} {rs}</span> — "
+            f"<span style='color:{DIRE_COLOR}'>{dn} {ds}</span> "
+            f"({rs + ds} total)",
+            unsafe_allow_html=True,
+        )
 
     rosh = data.get("roshan_kills", {"radiant": 0, "dire": 0})
     rosh_total = rosh["radiant"] + rosh["dire"]
@@ -453,6 +477,10 @@ def render_match_analysis(data: dict) -> None:
     #     f"({torm_total} total)",
     #     unsafe_allow_html=True,
     # )
+
+    if not replay_available:
+        st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
+        return
 
     st.divider()
 
