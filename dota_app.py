@@ -333,14 +333,16 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
 
 def analyse_special_events(events: list[dict]) -> dict:
     """
-    Scan sorted events for first tower death and first Roshan kill (Aegis proxy).
+    Scan sorted events for first tower death, first barracks death, and first Roshan kill (Aegis proxy).
 
-    First Tower  — credited to the team that did NOT lose the tower.
-    First Aegis  — credited to the team whose hero killed Roshan first.
+    First Tower    — credited to the team that did NOT lose the tower.
+    First Barracks — credited to the team that did NOT lose the barracks.
+    First Aegis    — credited to the team whose hero killed Roshan first.
 
-    Returns {"first_tower": event | None, "first_aegis": event | None}.
+    Returns {"first_tower": event | None, "first_barracks": event | None, "first_aegis": event | None}.
     """
     first_tower: dict | None = None
+    first_barracks: dict | None = None
     first_aegis: dict | None = None
 
     for e in events:
@@ -349,13 +351,17 @@ def analyse_special_events(events: list[dict]) -> dict:
             lost = e.get("lost_team", 0)
             got = 3 if lost == 2 else (2 if lost == 3 else 0)
             first_tower = {**e, "got_team": got, "is_radiant": got == 2}
+        if first_barracks is None and etype == "barracks":
+            lost = e.get("lost_team", 0)
+            got = 3 if lost == 2 else (2 if lost == 3 else 0)
+            first_barracks = {**e, "got_team": got, "is_radiant": got == 2}
         if first_aegis is None and etype == "roshan":
             kt = e.get("killer_team", 0)
             first_aegis = {**e, "is_radiant": kt == 2}
-        if first_tower is not None and first_aegis is not None:
+        if first_tower is not None and first_barracks is not None and first_aegis is not None:
             break
 
-    return {"first_tower": first_tower, "first_aegis": first_aegis}
+    return {"first_tower": first_tower, "first_barracks": first_barracks, "first_aegis": first_aegis}
 
 
 # ── Full match pipeline ────────────────────────────────────────────────────────
@@ -428,6 +434,7 @@ def process_match(match_id: str) -> dict:
     milestones = analyse_kills(kills, radiant_score + dire_score)
     special = analyse_special_events(kills)
     milestones["first_tower"] = special["first_tower"]
+    milestones["first_barracks"] = special["first_barracks"]
     milestones["first_aegis"] = special["first_aegis"]
 
     return {
@@ -504,7 +511,7 @@ def render_match_analysis(data: dict) -> None:
     st.markdown("**Notable Firsts**")
     tft = data.get("tormentor_first_team")
     torm_event = {"is_radiant": tft == 2} if tft in (2, 3) else None
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.markdown(
             f"**First Blood:** {result_label(m.get('first_blood'), rn, dn)}",
@@ -517,10 +524,15 @@ def render_match_analysis(data: dict) -> None:
         )
     with c3:
         st.markdown(
-            f"**First Aegis:** {result_label(m.get('first_aegis'), rn, dn)}",
+            f"**First Barracks:** {result_label(m.get('first_barracks'), rn, dn)}",
             unsafe_allow_html=True,
         )
     with c4:
+        st.markdown(
+            f"**First Aegis:** {result_label(m.get('first_aegis'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c5:
         st.markdown(
             f"**First Tormentor:** {result_label(torm_event, rn, dn)}",
             unsafe_allow_html=True,
@@ -584,12 +596,16 @@ def render_match_analysis(data: dict) -> None:
             counted_set: set[int] = set()
             deny_set: set[int] = set()
             tower_set: set[int] = set()
+            barracks_set: set[int] = set()
             roshan_set: set[int] = set()
             _total = 0
             for _i, _k in enumerate(raw_kills):
                 etype = _k.get("type")
                 if etype == "tower":
                     tower_set.add(_i)
+                    continue
+                if etype == "barracks":
+                    barracks_set.add(_i)
                     continue
                 if etype == "roshan":
                     roshan_set.add(_i)
@@ -610,6 +626,7 @@ def render_match_analysis(data: dict) -> None:
                 kt = k.get("killer_team", 0)
                 is_deny = i in deny_set
                 is_tower = i in tower_set
+                is_barracks = i in barracks_set
                 is_roshan = i in roshan_set
                 is_counted = i in counted_set
                 if is_counted:
@@ -620,6 +637,10 @@ def render_match_analysis(data: dict) -> None:
                     lost = k.get("lost_team", 0)
                     got = 3 if lost == 2 else (2 if lost == 3 else 0)
                     credited = f"{_team_label(got)} (tower)"
+                elif is_barracks:
+                    lost = k.get("lost_team", 0)
+                    got = 3 if lost == 2 else (2 if lost == 3 else 0)
+                    credited = f"{_team_label(got)} (barracks)"
                 elif is_roshan:
                     credited = f"{_team_label(kt)} (roshan)"
                 elif is_deny:
@@ -633,6 +654,7 @@ def render_match_analysis(data: dict) -> None:
                     "yes" if is_counted else
                     "DENY" if is_deny else
                     "TOWER" if is_tower else
+                    "BARRACKS" if is_barracks else
                     "ROSHAN" if is_roshan else
                     "DROPPED"
                 )

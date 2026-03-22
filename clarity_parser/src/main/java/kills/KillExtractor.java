@@ -42,6 +42,19 @@ public class KillExtractor {
             return;
         }
 
+        // === Barracks deaths ===
+        // Radiant rax: npc_dota_goodguys_melee_rax_* / npc_dota_goodguys_range_rax_*
+        // Dire rax:    npc_dota_badguys_melee_rax_*  / npc_dota_badguys_range_rax_*
+        if (targetName.contains("_rax_") &&
+                (targetName.startsWith("npc_dota_goodguys") || targetName.startsWith("npc_dota_badguys"))) {
+            int lostTeam = targetName.startsWith("npc_dota_goodguys") ? 2 : 3;
+            out.println(String.format(
+                "{\"type\":\"barracks\",\"lost_team\":%d,\"target\":\"%s\",\"time\":%d,\"time_f\":%.3f}",
+                lostTeam, targetName, Math.round(gameTime), gameTime
+            ));
+            return;
+        }
+
         // === Roshan kill (First Aegis proxy) ===
         // The team that kills Roshan picks up the Aegis.
         if (targetName.contains("roshan")) {
