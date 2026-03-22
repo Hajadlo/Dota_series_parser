@@ -384,6 +384,15 @@ def process_match(match_id: str) -> dict:
     dire_score    = int(match.get("dire_score", 0))
     duration      = int(match.get("duration", 0))
 
+    # First Tormentor — available from OpenDota objectives, no replay needed.
+    tormentor_first_team: int | None = None
+    for obj in (match.get("objectives") or []):
+        if obj.get("type") == "CHAT_MESSAGE_MINIBOSS_KILL":
+            team = obj.get("team")
+            if team in (2, 3):
+                tormentor_first_team = team
+                break
+
     def _basic_info(replay_err: str | None = None) -> dict:
         return {
             "match_id": match_id,
@@ -398,6 +407,7 @@ def process_match(match_id: str) -> dict:
             "radiant_score": radiant_score,
             "dire_score": dire_score,
             "duration": duration,
+            "tormentor_first_team": tormentor_first_team,
         }
 
     replay_url = match.get("replay_url")
@@ -430,6 +440,7 @@ def process_match(match_id: str) -> dict:
         "raw_kills": kills,
         "total_expected_kills": radiant_score + dire_score,
         "duration": duration,
+        "tormentor_first_team": tormentor_first_team,
     }
 
 
@@ -491,7 +502,9 @@ def render_match_analysis(data: dict) -> None:
 
     # Notable firsts row
     st.markdown("**Notable Firsts**")
-    c1, c2, c3 = st.columns(3)
+    tft = data.get("tormentor_first_team")
+    torm_event = {"is_radiant": tft == 2} if tft in (2, 3) else None
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(
             f"**First Blood:** {result_label(m.get('first_blood'), rn, dn)}",
@@ -505,6 +518,11 @@ def render_match_analysis(data: dict) -> None:
     with c3:
         st.markdown(
             f"**First Aegis:** {result_label(m.get('first_aegis'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            f"**1st Tormentor:** {result_label(torm_event, rn, dn)}",
             unsafe_allow_html=True,
         )
 
