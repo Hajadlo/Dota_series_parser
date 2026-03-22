@@ -258,9 +258,10 @@ def run_kill_extractor(dem_path: str) -> list[dict]:
 
 def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
     """
-    kills: list of {"killer_team": int, "target": npc_name, "time": int, "time_f": float}
-      killer_team: 2 = Radiant got the kill, 3 = Dire got the kill
-                   0 = deny (attacker and target on same team) — NOT counted as a kill
+    kills: list of events sorted by time_f (output of run_kill_extractor).
+      type="kill"   → hero kill event; killer_team 2=Radiant, 3=Dire, 0=deny (not counted)
+      type="tower"  → tower death — skipped here, handled by analyse_special_events()
+      type="roshan" → Roshan death — skipped here, handled by analyse_special_events()
     total_expected_kills: radiant_score + dire_score from OpenDota (authoritative total).
         Clarity emits phantom DOTA_COMBATLOG_DEATH events after the ancient is destroyed;
         those always sort chronologically last.  We stop counting as soon as we hit the
@@ -275,13 +276,17 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
     still dies and isTargetHero() fires. We never inspect the attacker, so no
     isAttackerHero() illusion-overcounting or summon-undercounting bugs.
 
-    Returns milestone dict.
+    Returns milestone dict including first_blood.
     """
     radiant_k = dire_k = total_k = 0
     first_to: dict[int, dict | None] = {5: None, 10: None, 15: None, 20: None}
     nth_kill: dict[int, dict | None] = {10: None, 20: None, 30: None}
+    first_blood: dict | None = None
 
     for k in kills:
+        # Only process hero kill events; tower/roshan/etc. are handled separately.
+        if k.get("type") not in ("kill", None):
+            continue
         # killer_team: 2 = Radiant, 3 = Dire (derived from getTargetTeam() flip in Java)
         killer_team = k.get("killer_team", 0)
         if killer_team == 2:
@@ -292,6 +297,9 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
             continue
         total_k += 1
         event = {**k, "is_radiant": is_radiant}
+
+        if first_blood is None:
+            first_blood = event
 
         if is_radiant:
             radiant_k += 1
@@ -319,7 +327,35 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
         "total_kills": total_k,
         "first_to": first_to,
         "nth_kill": nth_kill,
+        "first_blood": first_blood,
     }
+
+
+def analyse_special_events(events: list[dict]) -> dict:
+    """
+    Scan sorted events for first tower death and first Roshan kill (Aegis proxy).
+
+    First Tower  — credited to the team that did NOT lose the tower.
+    First Aegis  — credited to the team whose hero killed Roshan first.
+
+    Returns {"first_tower": event | None, "first_aegis": event | None}.
+    """
+    first_tower: dict | None = None
+    first_aegis: dict | None = None
+
+    for e in events:
+        etype = e.get("type")
+        if first_tower is None and etype == "tower":
+            lost = e.get("lost_team", 0)
+            got = 3 if lost == 2 else (2 if lost == 3 else 0)
+            first_tower = {**e, "got_team": got, "is_radiant": got == 2}
+        if first_aegis is None and etype == "roshan":
+            kt = e.get("killer_team", 0)
+            first_aegis = {**e, "is_radiant": kt == 2}
+        if first_tower is not None and first_aegis is not None:
+            break
+
+    return {"first_tower": first_tower, "first_aegis": first_aegis}
 
 
 # ── Full match pipeline ────────────────────────────────────────────────────────
@@ -380,6 +416,9 @@ def process_match(match_id: str) -> dict:
         return _basic_info(replay_err=str(exc))
 
     milestones = analyse_kills(kills, radiant_score + dire_score)
+    special = analyse_special_events(kills)
+    milestones["first_tower"] = special["first_tower"]
+    milestones["first_aegis"] = special["first_aegis"]
 
     return {
         "match_id": match_id,
@@ -450,6 +489,27 @@ def render_match_analysis(data: dict) -> None:
 
     st.divider()
 
+    # Notable firsts row
+    st.markdown("**Notable Firsts**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            f"**First Blood:** {result_label(m.get('first_blood'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            f"**First Tower:** {result_label(m.get('first_tower'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            f"**First Aegis:** {result_label(m.get('first_aegis'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
     # Nth kill row
     st.markdown("**Nth Kill (who scored it)**")
     c1, c2, c3 = st.columns(3)
@@ -505,8 +565,17 @@ def render_match_analysis(data: dict) -> None:
             # Walk the list as analyse_kills() does to mark which were counted
             counted_set: set[int] = set()
             deny_set: set[int] = set()
+            tower_set: set[int] = set()
+            roshan_set: set[int] = set()
             _total = 0
             for _i, _k in enumerate(raw_kills):
+                etype = _k.get("type")
+                if etype == "tower":
+                    tower_set.add(_i)
+                    continue
+                if etype == "roshan":
+                    roshan_set.add(_i)
+                    continue
                 if _k.get("is_deny"):
                     deny_set.add(_i)
                     continue
@@ -522,18 +591,42 @@ def render_match_analysis(data: dict) -> None:
             for i, k in enumerate(raw_kills):
                 kt = k.get("killer_team", 0)
                 is_deny = i in deny_set
+                is_tower = i in tower_set
+                is_roshan = i in roshan_set
                 is_counted = i in counted_set
                 if is_counted:
                     _seq += 1
                 att_raw = k.get("attacker_team_raw", -1)
+
+                if is_tower:
+                    lost = k.get("lost_team", 0)
+                    got = 3 if lost == 2 else (2 if lost == 3 else 0)
+                    credited = f"{_team_label(got)} (tower)"
+                elif is_roshan:
+                    credited = f"{_team_label(kt)} (roshan)"
+                elif is_deny:
+                    credited = "deny"
+                elif kt in (2, 3):
+                    credited = _team_label(kt)
+                else:
+                    credited = f"? ({kt})"
+
+                counted_label = (
+                    "yes" if is_counted else
+                    "DENY" if is_deny else
+                    "TOWER" if is_tower else
+                    "ROSHAN" if is_roshan else
+                    "DROPPED"
+                )
+
                 rows.append({
                     "#": _seq if is_counted else "",
                     "time": _mm_ss(k.get("time_f", k.get("time", 0))),
                     "target": _short(k.get("target", "")),
                     "attacker": _short(k.get("attacker", "")),
                     "att_team": _team_label(att_raw),
-                    "credited_to": "deny" if is_deny else (_team_label(kt) if kt in (2, 3) else f"? ({kt})"),
-                    "counted": "yes" if is_counted else ("DENY" if is_deny else "DROPPED"),
+                    "credited_to": credited,
+                    "counted": counted_label,
                 })
 
             st.dataframe(rows, use_container_width=True)

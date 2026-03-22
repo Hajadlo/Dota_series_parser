@@ -24,6 +24,38 @@ public class KillExtractor {
             return;
         }
 
+        String targetName = cle.getTargetName();
+        if (targetName == null) targetName = "";
+        float gameTime = cle.getTimestamp();
+
+        // === Tower deaths ===
+        // Radiant towers: npc_dota_goodguys_tower* → lost_team=2 (Radiant lost it)
+        // Dire towers:    npc_dota_badguys_tower*  → lost_team=3 (Dire lost it)
+        // The opposing team gets "First Tower" credit regardless of attacker.
+        if (targetName.startsWith("npc_dota_goodguys_tower") ||
+                targetName.startsWith("npc_dota_badguys_tower")) {
+            int lostTeam = targetName.startsWith("npc_dota_goodguys") ? 2 : 3;
+            out.println(String.format(
+                "{\"type\":\"tower\",\"lost_team\":%d,\"target\":\"%s\",\"time\":%d,\"time_f\":%.3f}",
+                lostTeam, targetName, Math.round(gameTime), gameTime
+            ));
+            return;
+        }
+
+        // === Roshan kill (First Aegis proxy) ===
+        // The team that kills Roshan picks up the Aegis.
+        if (targetName.contains("roshan")) {
+            int killerTeam = cle.getAttackerTeam();
+            if (killerTeam == 2 || killerTeam == 3) {
+                out.println(String.format(
+                    "{\"type\":\"roshan\",\"killer_team\":%d,\"target\":\"%s\",\"time\":%d,\"time_f\":%.3f}",
+                    killerTeam, targetName, Math.round(gameTime), gameTime
+                ));
+            }
+            return;
+        }
+
+        // === Hero kills ===
         // isTargetHero() — direct proto boolean, no string-table lookup.
         // True only for real hero units (not towers, couriers, Roshan, neutrals, summons).
         if (!cle.isTargetHero()) {
@@ -37,32 +69,23 @@ public class KillExtractor {
 
         // Filter Aegis (Immortality) and Wraith King Reincarnation deaths.
         // Dota 2 does NOT count these in the kill score (radiant_score / dire_score).
-        // Clarity fires a full DOTA_COMBATLOG_DEATH event for them anyway — this flag suppresses them.
         if (cle.isWillReincarnate()) {
             return;
         }
 
         // getAttackerTeam() guard: exclude kills by neutral units (team 4), Roshan (team 0),
-        // Tormentors, polar furbolgs, and any other non-player-team unit.
-        // Only events where a Radiant (2) or Dire (3) unit is the attacker count as real kills.
-        // NOTE: attribution is still derived from targetTeam (flip), not attackerTeam —
-        // this correctly handles summon kills (Spirit Bear, Warlock Golem, etc.) where the
-        // summon's team matches the owner's team.
+        // and any other non-player-team unit.
         int attackerTeam = cle.getAttackerTeam();
         if (attackerTeam != 2 && attackerTeam != 3) {
             return;
         }
 
         // getTargetTeam() — direct proto int, no string-table lookup.
-        // 2 = Radiant hero died  → Dire gets kill credit (killerTeam = 3)
-        // 3 = Dire hero died     → Radiant gets kill credit (killerTeam = 2)
         int targetTeam = cle.getTargetTeam();
         if (targetTeam != 2 && targetTeam != 3) {
             return;
         }
 
-        float gameTime = cle.getTimestamp();
-        String targetName = cle.getTargetName();
         String attackerName = cle.getAttackerName();
         if (attackerName == null) attackerName = "";
 
@@ -71,21 +94,20 @@ public class KillExtractor {
         // so the Python analyser skips it, while still preserving it in raw output
         // for debug visibility (is_deny=true).
         if (attackerTeam == targetTeam) {
-            String line = String.format(
-                "{\"killer_team\":0,\"is_deny\":true,\"target\":\"%s\",\"attacker\":\"%s\",\"attacker_team_raw\":%d,\"time\":%d,\"time_f\":%.3f}",
+            out.println(String.format(
+                "{\"type\":\"kill\",\"killer_team\":0,\"is_deny\":true,\"target\":\"%s\",\"attacker\":\"%s\",\"attacker_team_raw\":%d,\"time\":%d,\"time_f\":%.3f}",
                 targetName, attackerName, cle.getAttackerTeam(), Math.round(gameTime), gameTime
-            );
-            out.println(line);
+            ));
             return;
         }
 
+        // 2 = Radiant hero died → Dire gets kill credit (killerTeam = 3)
+        // 3 = Dire hero died   → Radiant gets kill credit (killerTeam = 2)
         int killerTeam = (targetTeam == 2) ? 3 : 2;
-
-        String line = String.format(
-            "{\"killer_team\":%d,\"target\":\"%s\",\"attacker\":\"%s\",\"attacker_team_raw\":%d,\"time\":%d,\"time_f\":%.3f}",
+        out.println(String.format(
+            "{\"type\":\"kill\",\"killer_team\":%d,\"target\":\"%s\",\"attacker\":\"%s\",\"attacker_team_raw\":%d,\"time\":%d,\"time_f\":%.3f}",
             killerTeam, targetName, attackerName, cle.getAttackerTeam(), Math.round(gameTime), gameTime
-        );
-        out.println(line);
+        ));
     }
 
     public void run(String[] args) throws Exception {
