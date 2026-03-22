@@ -6,7 +6,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 
 import requests
 import streamlit as st
@@ -168,30 +167,15 @@ def fetch_series_matches(match: dict) -> list[dict]:
 
 # ── Replay parsing ─────────────────────────────────────────────────────────────
 
-def download_and_decompress_replay(replay_url: str, dest_path: str, retries: int = 3) -> None:
-    """Download .dem.bz2, decompress to dest_path (.dem).
-    Retries up to `retries` times on transient 5xx errors from Valve's CDN."""
-    last_exc: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.get(replay_url, stream=True, timeout=120)
-            resp.raise_for_status()
-            decompressor = bz2.BZ2Decompressor()
-            with open(dest_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192 * 4):
-                    if chunk:
-                        f.write(decompressor.decompress(chunk))
-            return
-        except requests.HTTPError as exc:
-            last_exc = exc
-            status = exc.response.status_code if exc.response is not None else None
-            if status in (500, 502, 503, 504) and attempt < retries:
-                wait = 5 * attempt
-                st.toast(f"Replay server returned {status}, retrying in {wait}s… ({attempt}/{retries})")
-                time.sleep(wait)
-                continue
-            raise
-    raise last_exc  # type: ignore[misc]
+def download_and_decompress_replay(replay_url: str, dest_path: str) -> None:
+    """Download .dem.bz2, decompress to dest_path (.dem)."""
+    resp = requests.get(replay_url, stream=True, timeout=120)
+    resp.raise_for_status()
+    decompressor = bz2.BZ2Decompressor()
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192 * 4):
+            if chunk:
+                f.write(decompressor.decompress(chunk))
 
 
 def _find_java() -> str:
@@ -358,6 +342,7 @@ def process_match(match_id: str) -> dict:
 
     radiant_score = int(match.get("radiant_score", 0))
     dire_score    = int(match.get("dire_score", 0))
+    duration      = int(match.get("duration", 0))
 
     # Parse objectives for Roshan kills (and Tormentor, commented out for now)
     roshan_kills = {"radiant": 0, "dire": 0}
@@ -379,30 +364,38 @@ def process_match(match_id: str) -> dict:
             # elif team == 3:
             #     tormentor_kills["dire"] += 1
 
-    replay_url = match.get("replay_url")
-    if not replay_url:
+    def _basic_info(replay_err: str | None = None) -> dict:
         return {
             "match_id": match_id,
             "radiant_name": radiant_name,
             "dire_name": dire_name,
             "radiant_win": match.get("radiant_win", False),
             "replay_available": False,
+            "replay_error": replay_err,
             "milestones": None,
             "raw_kills": [],
             "total_expected_kills": radiant_score + dire_score,
             "radiant_score": radiant_score,
             "dire_score": dire_score,
+            "duration": duration,
             "roshan_kills": roshan_kills,
             "tormentor_first_team": tormentor_first_team,
         }
 
+    replay_url = match.get("replay_url")
+    if not replay_url:
+        return _basic_info()
+
     # Download & decompress replay, parse kills
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dem_path = os.path.join(tmpdir, f"{match_id}.dem")
-        with st.spinner(f"Downloading replay (~110 MB)..."):
-            download_and_decompress_replay(replay_url, dem_path)
-        with st.spinner("Parsing replay for kill events..."):
-            kills = run_kill_extractor(dem_path)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dem_path = os.path.join(tmpdir, f"{match_id}.dem")
+            with st.spinner(f"Downloading replay (~110 MB)..."):
+                download_and_decompress_replay(replay_url, dem_path)
+            with st.spinner("Parsing replay for kill events..."):
+                kills = run_kill_extractor(dem_path)
+    except Exception as exc:
+        return _basic_info(replay_err=str(exc))
 
     milestones = analyse_kills(kills, radiant_score + dire_score)
 
@@ -415,6 +408,7 @@ def process_match(match_id: str) -> dict:
         "milestones": milestones,
         "raw_kills": kills,
         "total_expected_kills": radiant_score + dire_score,
+        "duration": duration,
         "roshan_kills": roshan_kills,
         "tormentor_first_team": tormentor_first_team,
         # "tormentor_kills": tormentor_kills,
@@ -467,6 +461,10 @@ def render_match_analysis(data: dict) -> None:
             unsafe_allow_html=True,
         )
 
+    duration_secs = data.get("duration", 0)
+    if duration_secs:
+        st.markdown(f"Duration: **{duration_secs // 60}:{duration_secs % 60:02d}**")
+
     rosh = data.get("roshan_kills", {"radiant": 0, "dire": 0})
     rosh_total = rosh["radiant"] + rosh["dire"]
     torm_first = data.get("tormentor_first_team")
@@ -489,13 +487,17 @@ def render_match_analysis(data: dict) -> None:
     # st.markdown(
     #     f"Tormentor kills: "
     #     f"<span style='color:{RADIANT_COLOR}'>{rn} {torm['radiant']}</span> — "
-    #     f"<span style='color:{DIRE_COLOR}'>{dn} {torm['dire']}</span> "
+    #     f"<span style='color:{DIRE_COLOR}'>{dn} {torm['die']}</span> "
     #     f"({torm_total} total)",
     #     unsafe_allow_html=True,
     # )
 
     if not replay_available:
-        st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
+        replay_err = data.get("replay_error")
+        if replay_err:
+            st.warning(f"Replay download failed — kill milestones unavailable. ({replay_err})")
+        else:
+            st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
         return
 
     st.divider()
