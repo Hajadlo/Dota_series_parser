@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import requests
 import streamlit as st
@@ -167,15 +168,30 @@ def fetch_series_matches(match: dict) -> list[dict]:
 
 # ── Replay parsing ─────────────────────────────────────────────────────────────
 
-def download_and_decompress_replay(replay_url: str, dest_path: str) -> None:
-    """Download .dem.bz2, decompress to dest_path (.dem)."""
-    resp = requests.get(replay_url, stream=True, timeout=120)
-    resp.raise_for_status()
-    decompressor = bz2.BZ2Decompressor()
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192 * 4):
-            if chunk:
-                f.write(decompressor.decompress(chunk))
+def download_and_decompress_replay(replay_url: str, dest_path: str, retries: int = 3) -> None:
+    """Download .dem.bz2, decompress to dest_path (.dem).
+    Retries up to `retries` times on transient 5xx errors from Valve's CDN."""
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(replay_url, stream=True, timeout=120)
+            resp.raise_for_status()
+            decompressor = bz2.BZ2Decompressor()
+            with open(dest_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192 * 4):
+                    if chunk:
+                        f.write(decompressor.decompress(chunk))
+            return
+        except requests.HTTPError as exc:
+            last_exc = exc
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (500, 502, 503, 504) and attempt < retries:
+                wait = 5 * attempt
+                st.toast(f"Replay server returned {status}, retrying in {wait}s… ({attempt}/{retries})")
+                time.sleep(wait)
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
 
 
 def _find_java() -> str:
