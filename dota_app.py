@@ -350,6 +350,7 @@ def analyse_special_events(events: list[dict]) -> dict:
     first_tower: dict | None = None
     first_barracks: dict | None = None
     first_aegis: dict | None = None
+    first_tormentor: dict | None = None
     radiant_towers = 0
     dire_towers = 0
     radiant_roshans = 0
@@ -381,11 +382,16 @@ def analyse_special_events(events: list[dict]) -> dict:
                 radiant_roshans += 1
             elif kt == 3:
                 dire_roshans += 1
+        elif etype == "tormentor":
+            if first_tormentor is None:
+                kt = e.get("killer_team", 0)
+                first_tormentor = {**e, "is_radiant": kt == 2}
 
     return {
         "first_tower": first_tower,
         "first_barracks": first_barracks,
         "first_aegis": first_aegis,
+        "first_tormentor": first_tormentor,
         "radiant_towers": radiant_towers,
         "dire_towers": dire_towers,
         "radiant_roshans": radiant_roshans,
@@ -419,15 +425,6 @@ def process_match(match_id: str) -> dict:
     dire_score    = int(match.get("dire_score", 0))
     duration      = int(match.get("duration", 0))
 
-    # First Tormentor — available from OpenDota objectives, no replay needed.
-    tormentor_first_team: int | None = None
-    for obj in (match.get("objectives") or []):
-        if obj.get("type") == "CHAT_MESSAGE_MINIBOSS_KILL":
-            team = obj.get("team")
-            if team in (2, 3):
-                tormentor_first_team = team
-                break
-
     def _basic_info(replay_err: str | None = None) -> dict:
         return {
             "match_id": match_id,
@@ -442,7 +439,6 @@ def process_match(match_id: str) -> dict:
             "radiant_score": radiant_score,
             "dire_score": dire_score,
             "duration": duration,
-            "tormentor_first_team": tormentor_first_team,
         }
 
     replay_url = match.get("replay_url")
@@ -469,6 +465,7 @@ def process_match(match_id: str) -> dict:
     milestones["dire_towers"] = special["dire_towers"]
     milestones["radiant_roshans"] = special["radiant_roshans"]
     milestones["dire_roshans"] = special["dire_roshans"]
+    milestones["first_tormentor"] = special["first_tormentor"]
 
     return {
         "match_id": match_id,
@@ -480,7 +477,6 @@ def process_match(match_id: str) -> dict:
         "raw_kills": kills,
         "total_expected_kills": radiant_score + dire_score,
         "duration": duration,
-        "tormentor_first_team": tormentor_first_team,
     }
 
 
@@ -565,8 +561,6 @@ def render_match_analysis(data: dict) -> None:
 
     # Notable firsts row
     st.markdown("**Notable Firsts**")
-    tft = data.get("tormentor_first_team")
-    torm_event = {"is_radiant": tft == 2} if tft in (2, 3) else None
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.markdown(
@@ -590,7 +584,7 @@ def render_match_analysis(data: dict) -> None:
         )
     with c5:
         st.markdown(
-            f"**First Tormentor:** {result_label(torm_event, rn, dn)}",
+            f"**First Tormentor:** {result_label(m.get('first_tormentor'), rn, dn)}",
             unsafe_allow_html=True,
         )
 
