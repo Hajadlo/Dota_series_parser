@@ -333,36 +333,64 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
 
 def analyse_special_events(events: list[dict]) -> dict:
     """
-    Scan sorted events for first tower death, first barracks death, and first Aegis pickup.
+    Scan sorted events for first tower death, first barracks death, first Aegis pickup,
+    and totals for towers and Roshans destroyed by each team.
 
     First Tower    — credited to the team that did NOT lose the tower.
     First Barracks — credited to the team that did NOT lose the barracks.
     First Aegis    — credited to the team whose hero picked up the Aegis (detected
                      via entity inventory change on CDOTA_Item_Aegis).
+    Tower totals   — radiant_towers = towers destroyed BY Radiant (Dire towers that fell).
+                     dire_towers    = towers destroyed BY Dire   (Radiant towers that fell).
+    Roshan totals  — radiant_roshans / dire_roshans by killer_team.
 
-    Returns {"first_tower": event | None, "first_barracks": event | None, "first_aegis": event | None}.
+    Returns dict with first_tower, first_barracks, first_aegis,
+    radiant_towers, dire_towers, radiant_roshans, dire_roshans.
     """
     first_tower: dict | None = None
     first_barracks: dict | None = None
     first_aegis: dict | None = None
+    radiant_towers = 0
+    dire_towers = 0
+    radiant_roshans = 0
+    dire_roshans = 0
 
     for e in events:
         etype = e.get("type")
-        if first_tower is None and etype == "tower":
+        if etype == "tower":
             lost = e.get("lost_team", 0)
             got = 3 if lost == 2 else (2 if lost == 3 else 0)
-            first_tower = {**e, "got_team": got, "is_radiant": got == 2}
-        if first_barracks is None and etype == "barracks":
-            lost = e.get("lost_team", 0)
-            got = 3 if lost == 2 else (2 if lost == 3 else 0)
-            first_barracks = {**e, "got_team": got, "is_radiant": got == 2}
-        if first_aegis is None and etype == "aegis":
+            if first_tower is None:
+                first_tower = {**e, "got_team": got, "is_radiant": got == 2}
+            if got == 2:
+                radiant_towers += 1
+            elif got == 3:
+                dire_towers += 1
+        elif etype == "barracks":
+            if first_barracks is None:
+                lost = e.get("lost_team", 0)
+                got = 3 if lost == 2 else (2 if lost == 3 else 0)
+                first_barracks = {**e, "got_team": got, "is_radiant": got == 2}
+        elif etype == "aegis":
+            if first_aegis is None:
+                kt = e.get("killer_team", 0)
+                first_aegis = {**e, "is_radiant": kt == 2}
+        elif etype == "roshan":
             kt = e.get("killer_team", 0)
-            first_aegis = {**e, "is_radiant": kt == 2}
-        if first_tower is not None and first_barracks is not None and first_aegis is not None:
-            break
+            if kt == 2:
+                radiant_roshans += 1
+            elif kt == 3:
+                dire_roshans += 1
 
-    return {"first_tower": first_tower, "first_barracks": first_barracks, "first_aegis": first_aegis}
+    return {
+        "first_tower": first_tower,
+        "first_barracks": first_barracks,
+        "first_aegis": first_aegis,
+        "radiant_towers": radiant_towers,
+        "dire_towers": dire_towers,
+        "radiant_roshans": radiant_roshans,
+        "dire_roshans": dire_roshans,
+    }
 
 
 # ── Full match pipeline ────────────────────────────────────────────────────────
@@ -437,6 +465,10 @@ def process_match(match_id: str) -> dict:
     milestones["first_tower"] = special["first_tower"]
     milestones["first_barracks"] = special["first_barracks"]
     milestones["first_aegis"] = special["first_aegis"]
+    milestones["radiant_towers"] = special["radiant_towers"]
+    milestones["dire_towers"] = special["dire_towers"]
+    milestones["radiant_roshans"] = special["radiant_roshans"]
+    milestones["dire_roshans"] = special["dire_roshans"]
 
     return {
         "match_id": match_id,
@@ -505,6 +537,29 @@ def render_match_analysis(data: dict) -> None:
     if not replay_available:
         st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
         return
+
+    # Tower and Roshan totals (only available after replay parsing)
+    rad_t = m.get("radiant_towers", 0)
+    dir_t = m.get("dire_towers", 0)
+    total_t = rad_t + dir_t
+    rad_r = m.get("radiant_roshans", 0)
+    dir_r = m.get("dire_roshans", 0)
+    total_r = rad_r + dir_r
+    tc1, tc2 = st.columns(2)
+    with tc1:
+        st.markdown(
+            f"Total Towers: **{total_t}** "
+            f"(<span style='color:{RADIANT_COLOR}'>{rad_t}</span>/"
+            f"<span style='color:{DIRE_COLOR}'>{dir_t}</span>)",
+            unsafe_allow_html=True,
+        )
+    with tc2:
+        st.markdown(
+            f"Total Roshans: **{total_r}** "
+            f"(<span style='color:{RADIANT_COLOR}'>{rad_r}</span>/"
+            f"<span style='color:{DIRE_COLOR}'>{dir_r}</span>)",
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
