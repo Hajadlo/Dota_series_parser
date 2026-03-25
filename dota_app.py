@@ -559,37 +559,6 @@ def render_match_analysis(data: dict) -> None:
 
     st.divider()
 
-    # Notable firsts row
-    st.markdown("**Notable Firsts**")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        st.markdown(
-            f"**First Blood:** {result_label(m.get('first_blood'), rn, dn)}",
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            f"**First Tower:** {result_label(m.get('first_tower'), rn, dn)}",
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            f"**First Barracks:** {result_label(m.get('first_barracks'), rn, dn)}",
-            unsafe_allow_html=True,
-        )
-    with c4:
-        st.markdown(
-            f"**First Aegis:** {result_label(m.get('first_aegis'), rn, dn)}",
-            unsafe_allow_html=True,
-        )
-    with c5:
-        st.markdown(
-            f"**First Tormentor:** {result_label(m.get('first_tormentor'), rn, dn)}",
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
-
     # Nth kill row
     st.markdown("**Nth Kill (who scored it)**")
     c1, c2, c3 = st.columns(3)
@@ -620,6 +589,37 @@ def render_match_analysis(data: dict) -> None:
                 f"**First to {threshold}:** {result_label(m['first_to'][threshold], rn, dn)}",
                 unsafe_allow_html=True,
             )
+
+    st.divider()
+
+    # Notable firsts row (order: First Blood, First Tower, First Tormentor, First Barracks, First Aegis)
+    st.markdown("**Notable Firsts**")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.markdown(
+            f"**First Blood:** {result_label(m.get('first_blood'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            f"**First Tower:** {result_label(m.get('first_tower'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            f"**First Tormentor:** {result_label(m.get('first_tormentor'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            f"**First Barracks:** {result_label(m.get('first_barracks'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
+    with c5:
+        st.markdown(
+            f"**First Aegis:** {result_label(m.get('first_aegis'), rn, dn)}",
+            unsafe_allow_html=True,
+        )
 
     # ── Debug: raw kill events ─────────────────────────────────────────────────
     raw_kills = data.get("raw_kills", [])
