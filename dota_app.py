@@ -438,6 +438,13 @@ def process_match(match_id: str) -> dict:
     api_radiant_towers = towers_from_status(ts_dire)
     api_dire_towers    = towers_from_status(ts_radiant)
 
+    # Megacreeps from barracks bitmask (6 bits; 0 = all barracks gone = opponent has megas)
+    bs_radiant = int(match.get("barracks_status_radiant", 63))
+    bs_dire    = int(match.get("barracks_status_dire",    63))
+    # radiant_megas = True when Dire barracks all fell (Radiant earned megas)
+    api_radiant_megas = bs_dire == 0
+    api_dire_megas    = bs_radiant == 0
+
     def _basic_info(replay_err: str | None = None) -> dict:
         return {
             "match_id": match_id,
@@ -454,6 +461,8 @@ def process_match(match_id: str) -> dict:
             "duration": duration,
             "radiant_towers": api_radiant_towers,
             "dire_towers": api_dire_towers,
+            "radiant_megas": api_radiant_megas,
+            "dire_megas": api_dire_megas,
         }
 
     replay_url = match.get("replay_url")
@@ -559,8 +568,22 @@ def render_match_analysis(data: dict) -> None:
         )
 
     if not replay_available:
+        rad_megas = data.get("radiant_megas", False)
+        dire_megas = data.get("dire_megas", False)
+        if rad_megas or dire_megas:
+            if rad_megas and dire_megas:
+                megas_label = (
+                    f"<span style='color:{RADIANT_COLOR}'>{rn}</span> & "
+                    f"<span style='color:{DIRE_COLOR}'>{dn}</span>"
+                )
+            elif rad_megas:
+                megas_label = f"<span style='color:{RADIANT_COLOR}'>{rn}</span>"
+            else:
+                megas_label = f"<span style='color:{DIRE_COLOR}'>{dn}</span>"
+        else:
+            megas_label = "None"
         with tc2:
-            st.empty()
+            st.markdown(f"Megacreeps: **{megas_label}**", unsafe_allow_html=True)
         st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
         return
 
