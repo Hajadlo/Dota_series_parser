@@ -27,6 +27,12 @@ DIRE_COLOR = "#e05c5c"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def towers_from_status(tower_status: int) -> int:
+    """Return the number of towers destroyed from an 11-bit bitmask.
+    Each bit = 1 means that tower is still standing, so destroyed = 11 - popcount."""
+    return 11 - bin(tower_status).count("1")
+
+
 def parse_match_id(url: str) -> str | None:
     """Extract a Dota 2 match ID from a Dotabuff or OpenDota URL."""
     m = re.search(r"/matches/(\d+)", url)
@@ -425,6 +431,13 @@ def process_match(match_id: str) -> dict:
     dire_score    = int(match.get("dire_score", 0))
     duration      = int(match.get("duration", 0))
 
+    # Tower counts from API bitmask (available without replay)
+    ts_radiant = int(match.get("tower_status_radiant", 2047))
+    ts_dire    = int(match.get("tower_status_dire",    2047))
+    # radiant_towers = towers destroyed BY Radiant (i.e. Dire towers that fell)
+    api_radiant_towers = towers_from_status(ts_dire)
+    api_dire_towers    = towers_from_status(ts_radiant)
+
     def _basic_info(replay_err: str | None = None) -> dict:
         return {
             "match_id": match_id,
@@ -439,6 +452,8 @@ def process_match(match_id: str) -> dict:
             "radiant_score": radiant_score,
             "dire_score": dire_score,
             "duration": duration,
+            "radiant_towers": api_radiant_towers,
+            "dire_towers": api_dire_towers,
         }
 
     replay_url = match.get("replay_url")
@@ -530,17 +545,10 @@ def render_match_analysis(data: dict) -> None:
     if duration_secs:
         st.markdown(f"Duration: **{duration_secs // 60}:{duration_secs % 60:02d}**")
 
-    if not replay_available:
-        st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
-        return
-
-    # Tower and Roshan totals (only available after replay parsing)
-    rad_t = m.get("radiant_towers", 0)
-    dir_t = m.get("dire_towers", 0)
+    # Tower totals — available from API bitmask even without a replay
+    rad_t = data.get("radiant_towers", 0) if not replay_available else m.get("radiant_towers", 0)
+    dir_t = data.get("dire_towers", 0)    if not replay_available else m.get("dire_towers", 0)
     total_t = rad_t + dir_t
-    rad_r = m.get("radiant_roshans", 0)
-    dir_r = m.get("dire_roshans", 0)
-    total_r = rad_r + dir_r
     tc1, tc2 = st.columns(2)
     with tc1:
         st.markdown(
@@ -549,6 +557,17 @@ def render_match_analysis(data: dict) -> None:
             f"<span style='color:{DIRE_COLOR}'>{dir_t}</span>)",
             unsafe_allow_html=True,
         )
+
+    if not replay_available:
+        with tc2:
+            st.empty()
+        st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
+        return
+
+    # Roshan totals (replay only)
+    rad_r = m.get("radiant_roshans", 0)
+    dir_r = m.get("dire_roshans", 0)
+    total_r = rad_r + dir_r
     with tc2:
         st.markdown(
             f"Total Roshans: **{total_r}** "
