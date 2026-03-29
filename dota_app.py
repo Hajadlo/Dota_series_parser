@@ -114,8 +114,11 @@ def fetch_series_matches(match: dict) -> list[dict]:
             pass
 
     # 3. Fallback Method 2: SQL Explorer (Head-to-Head within +/- 24 hours)
-    # This catches matches where series_id hasn't been assigned yet
-    if radiant_team_id and dire_team_id and start_time:
+    # This catches matches where series_id hasn't been assigned yet.
+    # Only run when series_id is NOT set — if series_id is known, Methods 1 & 2
+    # already handle grouping correctly, and the broad time window would otherwise
+    # pull in matches from adjacent series between the same two teams.
+    if not series_id and radiant_team_id and dire_team_id and start_time:
         try:
             import urllib.parse
             min_time = start_time - 86400
@@ -170,6 +173,16 @@ def fetch_series_matches(match: dict) -> list[dict]:
             "start_time": m.get("start_time", 0),
         })
     return result
+
+
+# ── OpenDota parse trigger ─────────────────────────────────────────────────────
+
+def request_opendota_parse(match_id: str) -> None:
+    """Ask OpenDota to fetch and parse this match. Fire-and-forget."""
+    try:
+        requests.post(f"{OPENDOTA_BASE}/request/{match_id}", timeout=10)
+    except Exception:
+        pass
 
 
 # ── Replay parsing ─────────────────────────────────────────────────────────────
@@ -467,6 +480,7 @@ def process_match(match_id: str) -> dict:
 
     replay_url = match.get("replay_url")
     if not replay_url:
+        request_opendota_parse(match_id)
         return _basic_info()
 
     # Download & decompress replay, parse kills
