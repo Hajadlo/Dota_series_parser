@@ -121,8 +121,8 @@ def fetch_series_matches(match: dict) -> list[dict]:
     if not series_id and radiant_team_id and dire_team_id and start_time:
         try:
             import urllib.parse
-            min_time = start_time - 86400
-            max_time = start_time + 86400
+            min_time = start_time - 28800  # ±8 h covers any BO5 span (~6 h max)
+            max_time = start_time + 28800  # while excluding back-to-back series (22 h+ apart)
             sql = f'''
             SELECT match_id, start_time, leagueid, series_id
             FROM matches 
