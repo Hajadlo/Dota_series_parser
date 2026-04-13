@@ -275,6 +275,24 @@ def run_kill_extractor(dem_path: str) -> list[dict]:
 
 # ── Kill milestone analysis ────────────────────────────────────────────────────
 
+def is_countable_hero_kill(event: dict) -> bool:
+    """True only for real hero deaths that should count toward kill-score milestones.
+
+    Clarity's `isTargetHero()` can still emit Lone Druid Spirit Bear deaths as "kill"
+    events in some replays, so we also require the target unit name to be a real hero
+    npc (`npc_dota_hero_*`). This keeps scoreboard-based caps aligned with OpenDota's
+    authoritative radiant_score/dire_score totals.
+    """
+    if event.get("type") not in ("kill", None):
+        return False
+    if event.get("is_deny"):
+        return False
+    if event.get("killer_team", 0) not in (2, 3):
+        return False
+    target = event.get("target") or ""
+    return target.startswith("npc_dota_hero_")
+
+
 def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
     """
     kills: list of events sorted by time_f (output of run_kill_extractor).
@@ -283,17 +301,15 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
       type="roshan" → Roshan death — skipped here, handled by analyse_special_events()
     total_expected_kills: radiant_score + dire_score from OpenDota (authoritative total).
         Clarity emits phantom DOTA_COMBATLOG_DEATH events after the ancient is destroyed;
-        those always sort chronologically last.  We stop counting as soon as we hit the
-        expected total so phantom events at the tail are never reached.
+        those always sort chronologically last. We stop counting as soon as we hit the
+        expected total so phantom tail events are never reached.
 
     Java uses getTargetTeam() flip: killer_team = 5 - targetTeam (2→3, 3→2).
     Deny detection: when attackerTeam == targetTeam in Java, killer_team is set to 0
     and is_deny=true is emitted. These events are skipped here (not credited to anyone).
-    Filters: isTargetHero() (proto bool, no string-table) and !isTargetIllusion().
-    This correctly counts all kill types — direct hero kills, summon kills (Spirit Bear,
-    Warlock Golem, etc.), dominated-creep kills — because in every case the target hero
-    still dies and isTargetHero() fires. We never inspect the attacker, so no
-    isAttackerHero() illusion-overcounting or summon-undercounting bugs.
+    We also validate that the target name is an actual hero npc (`npc_dota_hero_*`),
+    because replay combat logs can occasionally label non-hero units such as Spirit Bear
+    as target-hero kills.
 
     Returns milestone dict including first_blood.
     """
@@ -303,17 +319,14 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
     first_blood: dict | None = None
 
     for k in kills:
-        # Only process hero kill events; tower/roshan/etc. are handled separately.
-        if k.get("type") not in ("kill", None):
+        if not is_countable_hero_kill(k):
             continue
         # killer_team: 2 = Radiant, 3 = Dire (derived from getTargetTeam() flip in Java)
         killer_team = k.get("killer_team", 0)
         if killer_team == 2:
             is_radiant = True
-        elif killer_team == 3:
-            is_radiant = False
         else:
-            continue
+            is_radiant = False
         total_k += 1
         event = {**k, "is_radiant": is_radiant}
 
@@ -553,6 +566,19 @@ def render_match_analysis(data: dict) -> None:
             f"({total} total)",
             unsafe_allow_html=True,
         )
+        raw_kills = data.get("raw_kills", [])
+        excluded_non_hero = [
+            k for k in raw_kills
+            if k.get("type") in ("kill", None)
+            and not k.get("is_deny")
+            and k.get("killer_team", 0) in (2, 3)
+            and not ((k.get("target") or "").startswith("npc_dota_hero_"))
+        ]
+        if excluded_non_hero:
+            st.warning(
+                f"Excluded {len(excluded_non_hero)} non-hero death event(s) from replay kill milestones "
+                f"(for example Spirit Bear deaths)."
+            )
     else:
         rs = data.get("radiant_score", 0)
         ds = data.get("dire_score", 0)
@@ -727,7 +753,7 @@ def render_match_analysis(data: dict) -> None:
                 if _k.get("is_deny"):
                     deny_set.add(_i)
                     continue
-                if _k.get("killer_team", 0) not in (2, 3):
+                if not is_countable_hero_kill(_k):
                     continue
                 _total += 1
                 counted_set.add(_i)
