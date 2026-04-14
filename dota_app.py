@@ -8,17 +8,48 @@ import subprocess
 import tempfile
 import time
 
+import gevent
 import requests
 import streamlit as st
+from dota2.client import Dota2Client
+from gevent.event import AsyncResult
+from steam.client import SteamClient
+from steam.enums import EResult
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Dota 2 Series Analyzer", layout="wide")
 
 OPENDOTA_BASE = "https://api.opendota.com/api"
+STEAM_API_BASE = "https://api.steampowered.com"
+VALVE_REPLAY_URL = "http://replay{cluster}.valve.net/570/{match_id}_{replay_salt}.dem.bz2"
 
 # Path to the fat JAR — relative to this file
 _HERE = os.path.dirname(os.path.abspath(__file__))
 JAR_PATH = os.path.join(_HERE, "clarity_parser", "build", "libs", "kill_extractor.jar")
+
+
+def load_local_env() -> None:
+    env_path = os.path.join(_HERE, ".env")
+    if not os.path.isfile(env_path):
+        return
+
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                value = value.strip().strip('"').strip("'")
+                os.environ[key] = value
+    except OSError:
+        pass
+
+
+load_local_env()
 
 # Team colours
 RADIANT_COLOR = "#4caf50"
@@ -34,8 +65,11 @@ def towers_from_status(tower_status: int) -> int:
 
 
 def parse_match_id(url: str) -> str | None:
-    """Extract a Dota 2 match ID from a Dotabuff or OpenDota URL."""
-    m = re.search(r"/matches/(\d+)", url)
+    """Extract a Dota 2 match ID from a URL or accept a raw numeric match ID."""
+    raw = url.strip()
+    if raw.isdigit():
+        return raw
+    m = re.search(r"/matches/(\d+)", raw)
     return m.group(1) if m else None
 
 
@@ -55,14 +89,244 @@ def result_label(event: dict | None, radiant_name: str, dire_name: str) -> str:
 # ── OpenDota API calls ─────────────────────────────────────────────────────────
 
 def fetch_match_uncached(match_id: str) -> dict:
-    resp = requests.get(f"{OPENDOTA_BASE}/matches/{match_id}", timeout=20)
+    resp = requests.get(f"{OPENDOTA_BASE}/matches/{match_id}", timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 
+def normalize_match_payload(match_id: str, match: dict, source: str) -> dict:
+    normalized = dict(match)
+    normalized["match_id"] = str(normalized.get("match_id") or match_id)
+
+    radiant_name = normalized.get("radiant_name") or normalized.get("radiant_team_name")
+    dire_name = normalized.get("dire_name") or normalized.get("dire_team_name")
+    if radiant_name and not isinstance(normalized.get("radiant_team"), dict):
+        normalized["radiant_team"] = {"name": radiant_name}
+    if dire_name and not isinstance(normalized.get("dire_team"), dict):
+        normalized["dire_team"] = {"name": dire_name}
+
+    normalized["_match_source"] = source
+    return normalized
+
+
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_match(match_id: str) -> dict:
-    return fetch_match_uncached(match_id)
+    try:
+        return normalize_match_payload(match_id, fetch_match_uncached(match_id), "OpenDota")
+    except Exception as opendota_exc:
+        valve_match = fetch_valve_match_details(match_id)
+        if valve_match:
+            normalized = normalize_match_payload(match_id, valve_match, "Valve")
+            normalized["_opendota_error"] = str(opendota_exc)
+            return normalized
+        raise
+
+
+def get_setting(name: str) -> str:
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.environ.get(name, "").strip()
+
+
+def has_valve_fallback_credentials() -> bool:
+    return bool(get_setting("STEAM_API_KEY")) or (
+        bool(get_setting("BOT_STEAM_USERNAME"))
+        and bool(get_setting("BOT_STEAM_PASSWORD"))
+    )
+
+
+def build_valve_replay_url(
+    match_id: str,
+    cluster: int | str | None,
+    replay_salt: int | str | None,
+) -> str | None:
+    if cluster in (None, "", 0, "0") or replay_salt in (None, "", 0, "0"):
+        return None
+    return VALVE_REPLAY_URL.format(
+        cluster=cluster,
+        match_id=match_id,
+        replay_salt=replay_salt,
+    )
+
+
+def gc_match_to_dict(match) -> dict:
+    tower_status = list(getattr(match, "tower_status", []))
+    barracks_status = list(getattr(match, "barracks_status", []))
+
+    return {
+        "match_id": str(getattr(match, "match_id", 0)),
+        "duration": int(getattr(match, "duration", 0)),
+        "start_time": int(getattr(match, "startTime", 0)),
+        "cluster": int(getattr(match, "cluster", 0)),
+        "replay_salt": int(getattr(match, "replay_salt", 0)),
+        "leagueid": int(getattr(match, "leagueid", 0)),
+        "series_id": int(getattr(match, "series_id", 0)),
+        "radiant_team_id": int(getattr(match, "radiant_team_id", 0)),
+        "dire_team_id": int(getattr(match, "dire_team_id", 0)),
+        "radiant_name": getattr(match, "radiant_team_name", "") or "Radiant",
+        "dire_name": getattr(match, "dire_team_name", "") or "Dire",
+        "radiant_score": int(getattr(match, "radiant_team_score", 0)),
+        "dire_score": int(getattr(match, "dire_team_score", 0)),
+        "radiant_win": int(getattr(match, "match_outcome", 0)) == 2,
+        "tower_status_radiant": int(tower_status[0]) if len(tower_status) > 0 else 2047,
+        "tower_status_dire": int(tower_status[1]) if len(tower_status) > 1 else 2047,
+        "barracks_status_radiant": int(barracks_status[0]) if len(barracks_status) > 0 else 63,
+        "barracks_status_dire": int(barracks_status[1]) if len(barracks_status) > 1 else 63,
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_gc_match_details(match_id: str) -> dict:
+    username = get_setting("BOT_STEAM_USERNAME")
+    password = get_setting("BOT_STEAM_PASSWORD")
+    if not username or not password:
+        return {}
+
+    steam_client = SteamClient()
+    dota_client = Dota2Client(steam_client)
+    sentry_dir = os.path.join(_HERE, "sentry")
+    os.makedirs(sentry_dir, exist_ok=True)
+    steam_client.set_credential_location(sentry_dir)
+    response = AsyncResult()
+
+    @steam_client.on("logged_on")
+    def _on_logged_on():
+        dota_client.launch()
+
+    @steam_client.on("error")
+    def _on_steam_error(result):
+        if not response.ready():
+            response.set(("steam_error", result, None))
+
+    @dota_client.on("ready")
+    def _on_gc_ready():
+        dota_client.request_match_details(int(match_id))
+
+    @dota_client.on("match_details")
+    def _on_match_details(returned_match_id, eresult, match):
+        if int(returned_match_id) == int(match_id) and not response.ready():
+            response.set(("match_details", eresult, match))
+
+    login_result = steam_client.login(username, password)
+    if login_result != EResult.OK:
+        return {}
+
+    runner = gevent.spawn(steam_client.run_forever)
+    try:
+        kind, status, match = response.get(timeout=45)
+        if kind != "match_details" or status != EResult.OK or match is None:
+            return {}
+        return gc_match_to_dict(match)
+    except Exception:
+        return {}
+    finally:
+        try:
+            steam_client.disconnect()
+        except Exception:
+            pass
+        gevent.sleep(0.5)
+        try:
+            runner.kill(block=False)
+        except Exception:
+            pass
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_valve_match_details(match_id: str) -> dict:
+    api_key = get_setting("STEAM_API_KEY")
+    if api_key:
+        try:
+            resp = requests.get(
+                f"{STEAM_API_BASE}/IDOTA2Match_570/GetMatchDetails/v1",
+                params={"key": api_key, "match_id": match_id},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                result = resp.json().get("result", {})
+                if isinstance(result, dict) and isinstance(result.get("match"), dict):
+                    result = result["match"]
+                if isinstance(result, dict) and result:
+                    return result
+        except Exception:
+            pass
+
+    return fetch_gc_match_details(match_id)
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def replay_url_exists(replay_url: str) -> bool:
+    try:
+        resp = requests.head(replay_url, allow_redirects=True, timeout=10)
+        if resp.status_code == 200:
+            return True
+        if resp.status_code not in (403, 405):
+            return False
+    except Exception:
+        pass
+
+    try:
+        resp = requests.get(
+            replay_url,
+            headers={"Range": "bytes=0-0"},
+            stream=True,
+            timeout=10,
+        )
+        try:
+            return resp.status_code in (200, 206)
+        finally:
+            resp.close()
+    except Exception:
+        return False
+
+
+def resolve_replay_url(
+    match_id: str,
+    match: dict | None = None,
+    *,
+    queue_opendota_parse: bool = False,
+) -> tuple[str | None, str | None, str | None]:
+    match_data = match or fetch_match(match_id)
+
+    replay_url = match_data.get("replay_url")
+    if replay_url:
+        return replay_url, "OpenDota", None
+
+    if queue_opendota_parse:
+        request_opendota_parse(match_id)
+
+    replay_url = build_valve_replay_url(
+        match_id,
+        match_data.get("cluster"),
+        match_data.get("replay_salt"),
+    )
+    if replay_url and replay_url_exists(replay_url):
+        return replay_url, "Valve CDN (via OpenDota match data)", None
+
+    valve_match = fetch_valve_match_details(match_id)
+    replay_url = build_valve_replay_url(
+        match_id,
+        valve_match.get("cluster"),
+        valve_match.get("replay_salt"),
+    )
+    if replay_url and replay_url_exists(replay_url):
+        return replay_url, "Valve CDN", None
+
+    if not has_valve_fallback_credentials():
+        return (
+            None,
+            None,
+            "Replay not available yet. OpenDota has no replay URL and no Valve fallback credentials are configured.",
+        )
+
+    return (
+        None,
+        None,
+        "Replay not available yet. Valve does not expose a downloadable replay for this match yet.",
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -154,14 +418,15 @@ def fetch_series_matches(match: dict) -> list[dict]:
     
     result = []
     for i, m in enumerate(series, start=1):
-        # Do a quick check on the cached replay_url to see if it's available
-        # It's important not to block here if it's slow, so we use a very short timeout
+        # Prefer OpenDota's replay_url, but fall back to a direct Valve replay URL
+        # when OpenDota hasn't exposed replay_url yet.
         has_replay = False
         try:
-            quick_check = requests.get(f"{OPENDOTA_BASE}/matches/{m['match_id']}", timeout=3).json()
-            has_replay = bool(quick_check.get("replay_url"))
+            quick_match = fetch_match(str(m["match_id"]))
+            replay_url, _, _ = resolve_replay_url(str(m["match_id"]), quick_match)
+            has_replay = bool(replay_url)
         except Exception:
-            pass # default to false if API is slow
+            pass  # default to false if APIs are slow
             
         label = f"Map {i} ✓" if has_replay else f"Map {i} ⏳"
         btn_type = "primary" if has_replay else "secondary"
@@ -471,14 +736,21 @@ def process_match(match_id: str) -> dict:
     api_radiant_megas = bs_dire == 0
     api_dire_megas    = bs_radiant == 0
 
-    def _basic_info(replay_err: str | None = None) -> dict:
+    match_source = match.get("_match_source", "OpenDota")
+
+    def _basic_info(
+        replay_err: str | None = None,
+        replay_source: str | None = None,
+    ) -> dict:
         return {
             "match_id": match_id,
             "radiant_name": radiant_name,
             "dire_name": dire_name,
             "radiant_win": match.get("radiant_win", False),
+            "match_source": match_source,
             "replay_available": False,
             "replay_error": replay_err,
+            "replay_source": replay_source,
             "milestones": None,
             "raw_kills": [],
             "total_expected_kills": radiant_score + dire_score,
@@ -491,10 +763,13 @@ def process_match(match_id: str) -> dict:
             "dire_megas": api_dire_megas,
         }
 
-    replay_url = match.get("replay_url")
+    replay_url, replay_source, replay_err = resolve_replay_url(
+        match_id,
+        match,
+        queue_opendota_parse=True,
+    )
     if not replay_url:
-        request_opendota_parse(match_id)
-        return _basic_info()
+        return _basic_info(replay_err=replay_err)
 
     # Download & decompress replay, parse kills
     try:
@@ -505,7 +780,7 @@ def process_match(match_id: str) -> dict:
             with st.spinner("Parsing replay for kill events..."):
                 kills = run_kill_extractor(dem_path)
     except Exception as exc:
-        return _basic_info(replay_err=str(exc))
+        return _basic_info(replay_err=str(exc), replay_source=replay_source)
 
     milestones = analyse_kills(kills, radiant_score + dire_score)
     special = analyse_special_events(kills)
@@ -523,7 +798,9 @@ def process_match(match_id: str) -> dict:
         "radiant_name": radiant_name,
         "dire_name": dire_name,
         "radiant_win": match.get("radiant_win", False),
+        "match_source": match_source,
         "replay_available": True,
+        "replay_source": replay_source,
         "milestones": milestones,
         "raw_kills": kills,
         "total_expected_kills": radiant_score + dire_score,
@@ -556,6 +833,16 @@ def render_match_analysis(data: dict) -> None:
             f"<span style='color:{DIRE_COLOR}'>**{dn}**</span> · {'LOSS' if rw else 'WIN'}",
             unsafe_allow_html=True,
         )
+
+    source_bits = []
+    match_source = data.get("match_source")
+    if match_source:
+        source_bits.append(f"Match data: {match_source}")
+    replay_source = data.get("replay_source")
+    if replay_source:
+        source_bits.append(f"Replay: {replay_source}")
+    if source_bits:
+        st.caption(" · ".join(source_bits))
 
     if replay_available:
         total = m["total_kills"]
@@ -624,7 +911,7 @@ def render_match_analysis(data: dict) -> None:
             megas_label = "None"
         with tc2:
             st.markdown(f"Megacreeps: **{megas_label}**", unsafe_allow_html=True)
-        st.info("Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
+        st.info(data.get("replay_error") or "Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
         return
 
     # Roshan totals (replay only)
@@ -839,7 +1126,7 @@ st.title("Dota 2 Series Analyzer")
 
 url_input = st.text_input(
     "url",
-    placeholder="https://www.dotabuff.com/matches/8697483686",
+    placeholder="https://www.dotabuff.com/matches/8697483686 or 8697483686",
     label_visibility="collapsed",
 )
 
@@ -847,7 +1134,7 @@ if st.button("Analyze", type="primary") and url_input.strip():
     raw = url_input.strip()
     match_id = parse_match_id(raw)
     if not match_id:
-        st.error("Could not extract a match ID from that URL. Expected format: https://www.dotabuff.com/matches/XXXXXXXXXX")
+        st.error("Could not extract a match ID. Provide either a Dotabuff/OpenDota match URL or a raw numeric match ID.")
     else:
         with st.spinner("Fetching match info..."):
             try:
@@ -870,13 +1157,26 @@ if st.button("Analyze", type="primary") and url_input.strip():
                 st.session_state.anchor_match_id = match_id
                 st.session_state.match_analysis = None
 
-                maps = fetch_series_matches(match)
-                st.session_state.series_matches = maps if maps else [{"match_id": match_id, "label": "Map 1"}]
+                if match.get("_match_source") == "Valve":
+                    st.info(
+                        "OpenDota timed out, so this run is using Valve match details. "
+                        "Series discovery is temporarily limited to the selected match."
+                    )
+                    st.session_state.series_matches = [{"match_id": match_id, "label": "Map 1"}]
+                else:
+                    maps = fetch_series_matches(match)
+                    st.session_state.series_matches = maps if maps else [{"match_id": match_id, "label": "Map 1"}]
 
             except requests.HTTPError as exc:
                 st.error(f"HTTP error from OpenDota: {exc}")
             except Exception as exc:
-                st.error(f"Error: {exc}")
+                if not has_valve_fallback_credentials() and "api.opendota.com" in str(exc):
+                    st.error(
+                        "OpenDota timed out and no Valve fallback credentials are configured. "
+                        "Add Steam credentials via Streamlit secrets or copy .env.example to .env."
+                    )
+                else:
+                    st.error(f"Error: {exc}")
 
 # ── Series map picker ──────────────────────────────────────────────────────────
 

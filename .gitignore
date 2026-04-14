@@ -5,5 +5,6 @@ analysis/
 __pycache__/
 .venv/
 .env
+sentry/
 .vscode/
 .gitnexus
