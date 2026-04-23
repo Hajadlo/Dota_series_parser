@@ -1,0 +1,12 @@
+[server]
+# Streamlit Cloud runs on port 8501 by default
+headless = true
+
+[browser]
+# Prevents Streamlit from opening a browser tab on startup (useful in cloud)
+gatherUsageStats = false
+
+[client]
+# Never render raw tracebacks in the public UI — they can contain
+# request URLs with `?api_key=...` query strings.
+showErrorDetails = false

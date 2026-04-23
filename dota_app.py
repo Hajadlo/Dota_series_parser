@@ -73,6 +73,21 @@ def parse_match_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+_SECRET_QUERY_PARAM_RE = re.compile(
+    r"(?i)([?&])(api_key|key|access_token|token|password)=[^&#\s]+"
+)
+
+
+def safe_error_str(exc: object) -> str:
+    """Redact common secret-bearing query params from an exception's string form.
+
+    Streamlit renders `st.error(f\"... {exc}\")` directly in the public UI, and
+    `requests.HTTPError` messages include the full URL — which may contain
+    `?api_key=...`. This strips those values before display.
+    """
+    return _SECRET_QUERY_PARAM_RE.sub(r"\1\2=***", str(exc))
+
+
 def team_span(name: str, is_radiant: bool) -> str:
     color = RADIANT_COLOR if is_radiant else DIRE_COLOR
     return f"<span style='color:{color}'>{name}</span>"
@@ -1168,7 +1183,7 @@ if st.button("Analyze", type="primary") and url_input.strip():
                     st.session_state.series_matches = maps if maps else [{"match_id": match_id, "label": "Map 1"}]
 
             except requests.HTTPError as exc:
-                st.error(f"HTTP error from OpenDota: {exc}")
+                st.error(f"HTTP error from OpenDota: {safe_error_str(exc)}")
             except Exception as exc:
                 if not has_valve_fallback_credentials() and "api.opendota.com" in str(exc):
                     st.error(
@@ -1176,7 +1191,7 @@ if st.button("Analyze", type="primary") and url_input.strip():
                         "Add Steam credentials via Streamlit secrets or copy .env.example to .env."
                     )
                 else:
-                    st.error(f"Error: {exc}")
+                    st.error(f"Error: {safe_error_str(exc)}")
 
 # ── Series map picker ──────────────────────────────────────────────────────────
 
@@ -1204,9 +1219,9 @@ if st.session_state.series_matches is not None:
                         st.session_state.match_analysis = data
                         st.rerun()
                     except FileNotFoundError as exc:
-                        st.error(str(exc))
+                        st.error(safe_error_str(exc))
                     except Exception as exc:
-                        st.error(f"Error analyzing {m['label']}: {exc}")
+                        st.error(f"Error analyzing {m['label']}: {safe_error_str(exc)}")
 
 # ── Match analysis output ──────────────────────────────────────────────────────
 
