@@ -19,7 +19,11 @@ from steam.enums import EResult
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Dota 2 Series Analyzer", layout="wide")
 
-OPENDOTA_BASE = "https://api.opendota.com/api"
+# OpenDota base URL is overridable for local testing of outage scenarios.
+OPENDOTA_BASE = os.environ.get(
+    "OPENDOTA_BASE_OVERRIDE",
+    "https://api.opendota.com/api",
+)
 STEAM_API_BASE = "https://api.steampowered.com"
 VALVE_REPLAY_URL = "http://replay{cluster}.valve.net/570/{match_id}_{replay_salt}.dem.bz2"
 
@@ -103,8 +107,33 @@ def result_label(event: dict | None, radiant_name: str, dire_name: str) -> str:
 
 # ── OpenDota API calls ─────────────────────────────────────────────────────────
 
+def _opendota_get_with_retry(url: str, *, timeout: float = 10.0):
+    """GET against OpenDota with one quick retry on transient network errors.
+
+    A single short backoff covers brief blips without prolonging UI waits when
+    OpenDota is genuinely down — in that case we want to fall through to the
+    Steam fallback chain quickly.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            return requests.get(url, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("OpenDota request failed without raising")  # defensive
+
+
 def fetch_match_uncached(match_id: str) -> dict:
-    resp = requests.get(f"{OPENDOTA_BASE}/matches/{match_id}", timeout=10)
+    resp = _opendota_get_with_retry(
+        f"{OPENDOTA_BASE}/matches/{match_id}",
+        timeout=10,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -344,53 +373,102 @@ def resolve_replay_url(
     )
 
 
+def _load_heroes_fallback_snapshot() -> dict:
+    """Load the bundled hero-id → npc_name snapshot used when OpenDota is down.
+
+    Returns an empty dict if the file is missing or unreadable; callers should
+    treat that as a non-fatal degraded state (hero names render as raw npc_*
+    strings rather than crashing).
+    """
+    fallback_path = os.path.join(_HERE, "heroes_fallback.json")
+    try:
+        with open(fallback_path, encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_heroes() -> dict:
-    """Return {hero_id (str) -> npc_name} mapping."""
-    resp = requests.get(f"{OPENDOTA_BASE}/heroes", timeout=20)
-    resp.raise_for_status()
-    heroes = resp.json()
-    return {str(h["id"]): h["name"] for h in heroes}
+    """Return {hero_id (str) -> npc_name} mapping.
+
+    Falls back to a bundled static snapshot when OpenDota is unreachable —
+    hero IDs/names change roughly twice a year, so a snapshot is acceptable
+    while the API is down.
+    """
+    try:
+        resp = _opendota_get_with_retry(f"{OPENDOTA_BASE}/heroes", timeout=5)
+        resp.raise_for_status()
+        heroes = resp.json()
+        return {str(h["id"]): h["name"] for h in heroes}
+    except Exception:
+        snapshot = _load_heroes_fallback_snapshot()
+        if snapshot:
+            try:
+                st.sidebar.warning(
+                    "Hero data is from a bundled snapshot — OpenDota /heroes is unreachable."
+                )
+            except Exception:
+                # st.sidebar may not be ready when called outside the script run.
+                pass
+            return snapshot
+        raise
 
 
 @st.cache_data(show_spinner=False, ttl=60)
-def fetch_series_matches(match: dict) -> list[dict]:
+def fetch_series_matches(match: dict) -> tuple[list[dict], bool]:
     """
-    Return all matches in the series, sorted by start_time ascending.
-    Tries multiple methods to find matches, as OpenDota's series grouping can be delayed.
-    Each item: {"match_id": str, "label": "Map 1", ...}
+    Return (matches, degraded) where matches are all matches in the series,
+    sorted by start_time ascending, and `degraded` is True when every OpenDota
+    series-discovery method failed (network/5xx) so we're returning only the
+    anchor match. Tries multiple methods because OpenDota's series grouping
+    can be delayed. Each match item: {"match_id": str, "label": "Map 1", ...}
     """
     league_id = match.get("leagueid")
     series_id = match.get("series_id")
     radiant_team_id = match.get("radiant_team_id")
     dire_team_id = match.get("dire_team_id")
     start_time = match.get("start_time", 0)
-    
-    found_matches = {} # deduplicate by match_id
+
+    found_matches: dict[str, dict] = {}  # deduplicate by match_id
+    methods_attempted = 0
+    methods_failed = 0
 
     # 1. Primary Method: Fetch by series_id via league matches
     if league_id and series_id:
+        methods_attempted += 1
         try:
-            resp = requests.get(f"{OPENDOTA_BASE}/leagues/{league_id}/matches", timeout=10)
+            resp = _opendota_get_with_retry(
+                f"{OPENDOTA_BASE}/leagues/{league_id}/matches",
+                timeout=10,
+            )
             if resp.status_code == 200:
                 all_matches = resp.json()
                 for m in all_matches:
                     if m.get("series_id") == series_id:
                         found_matches[str(m["match_id"])] = m
+            else:
+                methods_failed += 1
         except Exception:
-            pass
+            methods_failed += 1
 
     # 2. Fallback Method 1: Fetch by series_id via proMatches
     if series_id:
+        methods_attempted += 1
         try:
-            resp = requests.get(f"{OPENDOTA_BASE}/proMatches", timeout=10)
+            resp = _opendota_get_with_retry(f"{OPENDOTA_BASE}/proMatches", timeout=10)
             if resp.status_code == 200:
                 pro_matches = resp.json()
                 for m in pro_matches:
                     if m.get("series_id") == series_id:
                         found_matches[str(m["match_id"])] = m
+            else:
+                methods_failed += 1
         except Exception:
-            pass
+            methods_failed += 1
 
     # 3. Fallback Method 2: SQL Explorer (Head-to-Head within +/- 24 hours)
     # This catches matches where series_id hasn't been assigned yet.
@@ -398,20 +476,21 @@ def fetch_series_matches(match: dict) -> list[dict]:
     # already handle grouping correctly, and the broad time window would otherwise
     # pull in matches from adjacent series between the same two teams.
     if not series_id and radiant_team_id and dire_team_id and start_time:
+        methods_attempted += 1
         try:
             import urllib.parse
             min_time = start_time - 28800  # ±8 h covers any BO5 span (~6 h max)
             max_time = start_time + 28800  # while excluding back-to-back series (22 h+ apart)
             sql = f'''
             SELECT match_id, start_time, leagueid, series_id
-            FROM matches 
-            WHERE ((radiant_team_id = {radiant_team_id} AND dire_team_id = {dire_team_id}) 
+            FROM matches
+            WHERE ((radiant_team_id = {radiant_team_id} AND dire_team_id = {dire_team_id})
                OR (radiant_team_id = {dire_team_id} AND dire_team_id = {radiant_team_id}))
               AND start_time >= {min_time} AND start_time <= {max_time}
             ORDER BY start_time ASC
             '''
             url = f"{OPENDOTA_BASE}/explorer?sql={urllib.parse.quote(sql)}"
-            resp = requests.get(url, timeout=10)
+            resp = _opendota_get_with_retry(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 for row in data.get('rows', []):
@@ -419,8 +498,14 @@ def fetch_series_matches(match: dict) -> list[dict]:
                     if league_id and row.get('leagueid') and row.get('leagueid') != league_id:
                         continue
                     found_matches[str(row["match_id"])] = row
-        except Exception as e:
-            pass
+            else:
+                methods_failed += 1
+        except Exception:
+            methods_failed += 1
+
+    # Degraded if at least one method was attempted and all of them failed.
+    # When all matches are still found through one method, no degradation is signalled.
+    degraded = methods_attempted > 0 and methods_failed == methods_attempted
 
     # Ensure the anchor match is always in the list
     match_id_str = str(match["match_id"])
@@ -430,7 +515,7 @@ def fetch_series_matches(match: dict) -> list[dict]:
     # Sort and format the results
     series = list(found_matches.values())
     series.sort(key=lambda m: m.get("start_time", 0))
-    
+
     result = []
     for i, m in enumerate(series, start=1):
         # Prefer OpenDota's replay_url, but fall back to a direct Valve replay URL
@@ -442,17 +527,17 @@ def fetch_series_matches(match: dict) -> list[dict]:
             has_replay = bool(replay_url)
         except Exception:
             pass  # default to false if APIs are slow
-            
+
         label = f"Map {i} ✓" if has_replay else f"Map {i} ⏳"
         btn_type = "primary" if has_replay else "secondary"
-        
+
         result.append({
             "match_id": str(m["match_id"]),
             "label": label,
             "btn_type": btn_type,
             "start_time": m.get("start_time", 0),
         })
-    return result
+    return result, degraded
 
 
 # ── OpenDota parse trigger ─────────────────────────────────────────────────────
@@ -1171,6 +1256,7 @@ if st.button("Analyze", type="primary") and url_input.strip():
                 st.session_state.dire_name = dn
                 st.session_state.anchor_match_id = match_id
                 st.session_state.match_analysis = None
+                st.session_state.replay_retry_count = 0
 
                 if match.get("_match_source") == "Valve":
                     st.info(
@@ -1179,19 +1265,30 @@ if st.button("Analyze", type="primary") and url_input.strip():
                     )
                     st.session_state.series_matches = [{"match_id": match_id, "label": "Map 1"}]
                 else:
-                    maps = fetch_series_matches(match)
+                    maps, series_degraded = fetch_series_matches(match)
+                    if series_degraded:
+                        st.info(
+                            "Series detection unavailable (OpenDota series endpoints failed) — "
+                            "analyzing the requested match only."
+                        )
                     st.session_state.series_matches = maps if maps else [{"match_id": match_id, "label": "Map 1"}]
 
             except requests.HTTPError as exc:
                 st.error(f"HTTP error from OpenDota: {safe_error_str(exc)}")
             except Exception as exc:
-                if not has_valve_fallback_credentials() and "api.opendota.com" in str(exc):
+                # Any exception escaping fetch_match means OpenDota failed AND
+                # the Valve fallback chain didn't yield a result. Tailor the
+                # message to whether credentials are even configured.
+                if not has_valve_fallback_credentials():
                     st.error(
-                        "OpenDota timed out and no Valve fallback credentials are configured. "
+                        "OpenDota is unreachable and no Valve fallback credentials are configured. "
                         "Add Steam credentials via Streamlit secrets or copy .env.example to .env."
                     )
                 else:
-                    st.error(f"Error: {safe_error_str(exc)}")
+                    st.error(
+                        f"OpenDota is unreachable and the Valve fallback chain also failed. "
+                        f"Try again later. Details: {safe_error_str(exc)}"
+                    )
 
 # ── Series map picker ──────────────────────────────────────────────────────────
 
@@ -1215,6 +1312,7 @@ if st.session_state.series_matches is not None:
                 is_primary = m.get("btn_type") == "primary"
                 if st.button(m["label"], type="primary" if is_primary else "secondary", key=f"map_btn_{m['match_id']}"):
                     try:
+                        st.session_state.replay_retry_count = 0
                         data = process_match(m["match_id"])
                         st.session_state.match_analysis = data
                         st.rerun()
@@ -1228,17 +1326,34 @@ if st.session_state.series_matches is not None:
 if st.session_state.match_analysis is not None:
     render_match_analysis(st.session_state.match_analysis)
 
-    # Auto-retry every minute until the replay is available
+    # Auto-retry every minute until the replay is available, capped to avoid
+    # hanging the UI indefinitely when APIs stay down.
+    MAX_REPLAY_RETRIES = 5
     if not st.session_state.match_analysis.get("replay_available", True):
         match_id = st.session_state.match_analysis["match_id"]
-        status = st.empty()
-        for remaining in range(60, 0, -1):
-            status.info(f"Retrying replay download in {remaining}s... ⏳")
-            time.sleep(1)
-        status.info("Attempting to download replay... 🔄")
-        try:
-            new_data = process_match(match_id)
-            st.session_state.match_analysis = new_data
-        except Exception:
-            pass
-        st.rerun()
+        retries_done = st.session_state.get("replay_retry_count", 0)
+        if retries_done >= MAX_REPLAY_RETRIES:
+            st.error(
+                f"Replay still not available after {MAX_REPLAY_RETRIES} attempts. "
+                "OpenDota and Valve fallbacks have been exhausted — try again later."
+            )
+        else:
+            status = st.empty()
+            for remaining in range(60, 0, -1):
+                status.info(
+                    f"Retrying replay download in {remaining}s... "
+                    f"(attempt {retries_done + 1}/{MAX_REPLAY_RETRIES}) ⏳"
+                )
+                time.sleep(1)
+            status.info("Attempting to download replay... 🔄")
+            try:
+                new_data = process_match(match_id)
+                st.session_state.match_analysis = new_data
+                if new_data.get("replay_available", False):
+                    st.session_state.replay_retry_count = 0
+                else:
+                    st.session_state.replay_retry_count = retries_done + 1
+            except Exception as exc:
+                st.session_state.replay_retry_count = retries_done + 1
+                st.warning(f"Retry failed: {safe_error_str(exc)}")
+            st.rerun()
