@@ -336,7 +336,7 @@ def resolve_replay_url(
     match_data = match or fetch_match(match_id)
 
     replay_url = match_data.get("replay_url")
-    if replay_url:
+    if replay_url and replay_url_exists(replay_url):
         return replay_url, "OpenDota", None
 
     if queue_opendota_parse:
