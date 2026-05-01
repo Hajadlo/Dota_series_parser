@@ -905,6 +905,8 @@ def process_match(match_id: str) -> dict:
         "raw_kills": kills,
         "total_expected_kills": radiant_score + dire_score,
         "duration": duration,
+        "radiant_megas": api_radiant_megas,
+        "dire_megas": api_dire_megas,
     }
 
 
@@ -994,21 +996,22 @@ def render_match_analysis(data: dict) -> None:
             unsafe_allow_html=True,
         )
 
+    # Megacreeps — available from API bitmask, shown in both replay and no-replay paths
+    rad_megas = data.get("radiant_megas", False)
+    dire_megas = data.get("dire_megas", False)
+    if rad_megas and dire_megas:
+        megas_label = (
+            f"<span style='color:{RADIANT_COLOR}'>{rn}</span> & "
+            f"<span style='color:{DIRE_COLOR}'>{dn}</span>"
+        )
+    elif rad_megas:
+        megas_label = f"<span style='color:{RADIANT_COLOR}'>{rn}</span>"
+    elif dire_megas:
+        megas_label = f"<span style='color:{DIRE_COLOR}'>{dn}</span>"
+    else:
+        megas_label = "None"
+
     if not replay_available:
-        rad_megas = data.get("radiant_megas", False)
-        dire_megas = data.get("dire_megas", False)
-        if rad_megas or dire_megas:
-            if rad_megas and dire_megas:
-                megas_label = (
-                    f"<span style='color:{RADIANT_COLOR}'>{rn}</span> & "
-                    f"<span style='color:{DIRE_COLOR}'>{dn}</span>"
-                )
-            elif rad_megas:
-                megas_label = f"<span style='color:{RADIANT_COLOR}'>{rn}</span>"
-            else:
-                megas_label = f"<span style='color:{DIRE_COLOR}'>{dn}</span>"
-        else:
-            megas_label = "None"
         with tc2:
             st.markdown(f"Megacreeps: **{megas_label}**", unsafe_allow_html=True)
         st.info(data.get("replay_error") or "Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
@@ -1025,6 +1028,7 @@ def render_match_analysis(data: dict) -> None:
             f"<span style='color:{DIRE_COLOR}'>{dir_r}</span>)",
             unsafe_allow_html=True,
         )
+    st.markdown(f"Megacreeps: **{megas_label}**", unsafe_allow_html=True)
 
     st.divider()
 
