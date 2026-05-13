@@ -347,8 +347,19 @@ def resolve_replay_url(
         match_data.get("cluster"),
         match_data.get("replay_salt"),
     )
-    if replay_url and replay_url_exists(replay_url):
-        return replay_url, "Valve CDN (via OpenDota match data)", None
+    if replay_url:
+        if replay_url_exists(replay_url):
+            return replay_url, "Valve CDN (via OpenDota match data)", None
+        # If OpenDota already gave replay coordinates, the authenticated
+        # Valve/GC fallback is very unlikely to discover a different URL; it
+        # normally returns the same cluster/salt and can block for ~45s. Fail
+        # fast so the UI can render match basics instead of sitting on a
+        # spinner when the CDN returns 5xx for this replay.
+        return (
+            None,
+            None,
+            "Replay metadata exists, but Valve CDN is not serving the replay right now. Try again later.",
+        )
 
     valve_match = fetch_valve_match_details(match_id)
     replay_url = build_valve_replay_url(
@@ -518,18 +529,23 @@ def fetch_series_matches(match: dict) -> tuple[list[dict], bool]:
 
     result = []
     for i, m in enumerate(series, start=1):
-        # Prefer OpenDota's replay_url, but fall back to a direct Valve replay URL
-        # when OpenDota hasn't exposed replay_url yet.
-        has_replay = False
-        try:
-            quick_match = fetch_match(str(m["match_id"]))
-            replay_url, _, _ = resolve_replay_url(str(m["match_id"]), quick_match)
-            has_replay = bool(replay_url)
-        except Exception:
-            pass  # default to false if APIs are slow
+        # Keep series discovery responsive: this runs under the initial
+        # "Fetching match info..." spinner, so do not call resolve_replay_url()
+        # here. That helper can fall through to the authenticated Valve/GC
+        # fallback and block for ~45s per map when Valve CDN returns 5xx.
+        # The actual replay availability/download is checked later when the
+        # user selects a map via process_match().
+        replay_hint = bool(
+            m.get("replay_url")
+            or build_valve_replay_url(
+                str(m["match_id"]),
+                m.get("cluster"),
+                m.get("replay_salt"),
+            )
+        )
 
-        label = f"Map {i} ✓" if has_replay else f"Map {i} ⏳"
-        btn_type = "primary" if has_replay else "secondary"
+        label = f"Map {i} ✓" if replay_hint else f"Map {i} ⏳"
+        btn_type = "primary" if replay_hint else "secondary"
 
         result.append({
             "match_id": str(m["match_id"]),
