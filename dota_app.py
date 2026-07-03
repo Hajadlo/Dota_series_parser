@@ -1361,13 +1361,30 @@ _IM_WIN_BG = "#2e6b50"
 _IM_TEXT = "#c9d4e0"
 _IM_DIM = "#93a4b5"
 
+# Hint-verification cell colours
+_HINT_WRONG_BG = "#ff1744"     # VERY bright red — wrong hints must scream
+_HINT_OK_BG = "#1e4636"        # bland green — correct hints, low visual priority
+_HINT_OK_TEXT = "#7fae97"
+_HINT_EXPECTED_BG = "#fdd835"  # yellow — the selection that actually won when the hint is wrong
 
-def _im_card(title: str, rows: list[tuple[str, list[tuple[str, bool]]]]) -> str:
+# Cell render states → (background, text colour, font weight)
+_IM_CELL_STYLES = {
+    "off":        (_IM_CELL_BG, _IM_DIM, "400"),
+    "win":        (_IM_WIN_BG, "#eaf5ee", "600"),
+    "hint_ok":    (_HINT_OK_BG, _HINT_OK_TEXT, "600"),
+    "hint_wrong": (_HINT_WRONG_BG, "#ffffff", "700"),
+    "expected":   (_HINT_EXPECTED_BG, "#1c2430", "700"),
+}
+
+
+def _im_card(title: str, rows: list[tuple[str, list[tuple[str, str]]]]) -> str:
     """Build an HTML market card that mimics the trading tool's resolving view:
     a dark card with a header bar, one row per line, the line value in the
-    left label column, one cell per selection, winner highlighted green.
+    left label column, one cell per selection.
 
-    rows: [(label, [(selection_text, is_winner), ...]), ...]
+    rows: [(label, [(selection_text, state), ...]), ...] where state is a key
+    of _IM_CELL_STYLES ('win' = green winner in the split view; 'hint_ok' /
+    'hint_wrong' / 'expected' belong to the hint-verification view).
     """
     parts = [
         f"<div style='background:{_IM_CARD_BG};border:1px solid {_IM_BORDER};"
@@ -1383,10 +1400,8 @@ def _im_card(title: str, rows: list[tuple[str, list[tuple[str, bool]]]]) -> str:
             f"width:26%;border-bottom:2px solid {_IM_CARD_BG};white-space:nowrap;"
             f"font-weight:600;'>{label}</td>"
         )
-        for text, won in cells:
-            bg = _IM_WIN_BG if won else _IM_CELL_BG
-            color = "#eaf5ee" if won else _IM_DIM
-            weight = "600" if won else "400"
+        for text, state in cells:
+            bg, color, weight = _IM_CELL_STYLES.get(state, _IM_CELL_STYLES["off"])
             parts.append(
                 f"<td style='background:{bg};color:{color};padding:6px 8px;"
                 f"text-align:center;font-weight:{weight};"
@@ -1411,7 +1426,10 @@ def _ou_rows(result: int, label_suffix: str = "") -> list[tuple[str, list[tuple[
             continue
         rows.append((
             f"{line:g}{label_suffix}",
-            [("under", line > result), ("over", line < result)],
+            [
+                ("under", "win" if line > result else "off"),
+                ("over", "win" if line < result else "off"),
+            ],
         ))
     return rows
 
@@ -1431,7 +1449,10 @@ def _handicap_rows(
         home_wins = margin + line > 0
         rows.append((
             f"{line:+g}",
-            [(home_name, home_wins), (away_name, not home_wins)],
+            [
+                (home_name, "win" if home_wins else "off"),
+                (away_name, "off" if home_wins else "win"),
+            ],
         ))
     return rows
 
@@ -1463,23 +1484,24 @@ def _render_interval_cards(
         _im_card("Team Total Kills", _ou_rows(home_k, ", home") + _ou_rows(away_k, ", away")),
         _im_card(
             "Total Kills Parity",
-            [(str(total), [("odd", total % 2 == 1), ("even", total % 2 == 0)])],
+            [(str(total), [
+                ("odd", "win" if total % 2 == 1 else "off"),
+                ("even", "win" if total % 2 == 0 else "off"),
+            ])],
         ),
         _im_card(
             "Kills Winner (3-way)",
-            [("3-way", [(home_name, margin > 0), ("draw", margin == 0), (away_name, margin < 0)])],
+            [("3-way", [
+                (home_name, "win" if margin > 0 else "off"),
+                ("draw", "win" if margin == 0 else "off"),
+                (away_name, "win" if margin < 0 else "off"),
+            ])],
         ),
     ]
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
 # ── Interval-market hint verification (Dotabuff copypaste) ────────────────────
-
-_HINT_WRONG_BG = "#ff1744"   # VERY bright red — these are what the trader must catch
-_HINT_OK_BG = "#1e4636"      # bland green — correct hints, low visual priority
-_HINT_OK_TEXT = "#7fae97"
-_HINT_VOID_BG = "#2a3441"    # neutral — not reached / push / unsupported
-_HINT_VOID_TEXT = "#8fa1b3"
 
 # Only these markets are verified — every other marketName in the paste is ignored.
 _INTERVAL_HINT_MARKETS = {
@@ -1490,6 +1512,13 @@ _INTERVAL_HINT_MARKETS = {
     "map interval kills winner": "Winner",
 }
 _HINT_MARKET_ORDER = ["Total Kills", "Kills Handicap", "Team Total Kills", "Parity", "Winner"]
+_HINT_CARD_TITLES = {
+    "Total Kills": "Total Kills",
+    "Kills Handicap": "Kills Handicap",
+    "Team Total Kills": "Team Total Kills",
+    "Parity": "Total Kills Parity",
+    "Winner": "Kills Winner (3-way)",
+}
 
 
 def _parse_hint_paste(raw: str) -> tuple[list[dict], bool]:
@@ -1558,111 +1587,98 @@ def _parse_interval_param(value) -> int | None:
     return start // 10
 
 
-def _evaluate_interval_hint(market_label: str, entry: dict, home_k: int, away_k: int) -> dict:
-    """Resolve one interval-market hint against replay kills for its interval.
+def _hint_card_row(
+    market_label: str,
+    entry: dict,
+    home_k: int,
+    away_k: int,
+    home_name: str,
+    away_name: str,
+) -> tuple | None:
+    """Build one verification-card row for a pasted hint.
 
-    Returns {line, actual, verdict} with verdict in
-    'correct' | 'wrong' | 'push' | 'unsupported'.
+    Returns (sort_key, label, cells, verdict) or None when the hint is
+    unreadable. verdict ∈ 'correct' | 'wrong' | 'push'. Cells use
+    _IM_CELL_STYLES states: the hinted selection renders bland green when
+    correct and bright red when wrong; when wrong, the selection that actually
+    won is highlighted yellow ('expected').
     """
     params = entry.get("params") or {}
     hint = str(entry.get("hint", "")).strip().upper()
     total = home_k + away_k
     margin = home_k - away_k
 
-    def _outcome(actual: str, correct: bool | None, line: str = "—") -> dict:
-        verdict = "push" if correct is None else ("correct" if correct else "wrong")
-        return {"line": line, "actual": actual, "verdict": verdict}
+    def _cells(options: list[tuple[str, str]], actual: str | None) -> list[tuple[str, str]]:
+        out = []
+        for key, text in options:
+            if actual is None:  # push — no winning selection
+                state = "off"
+            elif key == hint == actual:
+                state = "hint_ok"
+            elif key == hint:
+                state = "hint_wrong"
+            elif key == actual:
+                state = "expected"
+            else:
+                state = "off"
+            out.append((text, state))
+        return out
+
+    def _verdict(actual: str | None) -> str:
+        if actual is None:
+            return "push"
+        return "correct" if actual == hint else "wrong"
+
+    ou_options = [("UNDER", "under"), ("OVER", "over")]
 
     if market_label == "Total Kills":
-        threshold = params.get("threshold")
-        if not isinstance(threshold, (int, float)) or hint not in ("OVER", "UNDER"):
-            return {"line": str(threshold), "actual": "—", "verdict": "unsupported"}
-        if total == threshold:
-            return _outcome(f"{total} kills → PUSH", None, f"{threshold:g}")
-        actual = "OVER" if total > threshold else "UNDER"
-        return _outcome(f"{total} kills → {actual}", actual == hint, f"{threshold:g}")
+        t = params.get("threshold")
+        if not isinstance(t, (int, float)) or hint not in ("OVER", "UNDER"):
+            return None
+        actual = None if total == t else ("OVER" if total > t else "UNDER")
+        label = f"{t:g}" + (" · push" if actual is None else "")
+        return ((0, t), label, _cells(ou_options, actual), _verdict(actual))
 
     if market_label == "Team Total Kills":
-        threshold = params.get("threshold")
+        t = params.get("threshold")
         side = str(params.get("side") or params.get("team") or "").strip().upper()
         if (
-            not isinstance(threshold, (int, float))
+            not isinstance(t, (int, float))
             or side not in ("HOME", "AWAY")
             or hint not in ("OVER", "UNDER")
         ):
-            return {"line": str(threshold), "actual": "—", "verdict": "unsupported"}
+            return None
         kills = home_k if side == "HOME" else away_k
-        line = f"{threshold:g}, {side.lower()}"
-        if kills == threshold:
-            return _outcome(f"{side.lower()} {kills} → PUSH", None, line)
-        actual = "OVER" if kills > threshold else "UNDER"
-        return _outcome(f"{side.lower()} {kills} → {actual}", actual == hint, line)
+        actual = None if kills == t else ("OVER" if kills > t else "UNDER")
+        label = f"{t:g}, {side.lower()}" + (" · push" if actual is None else "")
+        return ((0 if side == "HOME" else 1, t), label, _cells(ou_options, actual), _verdict(actual))
 
     if market_label == "Kills Handicap":
-        handicap = params.get("handicap")
-        if not isinstance(handicap, (int, float)) or hint not in ("HOME", "AWAY"):
-            return {"line": str(handicap), "actual": "—", "verdict": "unsupported"}
-        adj = margin + handicap  # handicap applied to Home
-        if adj == 0:
-            return _outcome(f"margin {margin:+d} → PUSH", None, f"{handicap:+g}")
-        actual = "HOME" if adj > 0 else "AWAY"
-        return _outcome(f"margin {margin:+d} → {actual}", actual == hint, f"{handicap:+g}")
+        h = params.get("handicap")
+        if not isinstance(h, (int, float)) or hint not in ("HOME", "AWAY"):
+            return None
+        adj = margin + h  # handicap applied to Home
+        actual = None if adj == 0 else ("HOME" if adj > 0 else "AWAY")
+        label = f"{h:+g}" + (" · push" if actual is None else "")
+        options = [("HOME", home_name), ("AWAY", away_name)]
+        # Descending line value = closest-to-even first, like the trading tool.
+        return ((0, -h), label, _cells(options, actual), _verdict(actual))
 
     if market_label == "Parity":
         if hint not in ("ODD", "EVEN"):
-            return {"line": "—", "actual": "—", "verdict": "unsupported"}
+            return None
         actual = "EVEN" if total % 2 == 0 else "ODD"
-        return _outcome(f"{total} kills → {actual}", actual == hint)
+        options = [("ODD", "odd"), ("EVEN", "even")]
+        return ((0, 0), str(total), _cells(options, actual), _verdict(actual))
 
     if market_label == "Winner":
         if hint not in ("HOME", "AWAY", "DRAW"):
-            return {"line": "—", "actual": "—", "verdict": "unsupported"}
+            return None
         actual = "HOME" if margin > 0 else ("AWAY" if margin < 0 else "DRAW")
-        return _outcome(f"{home_k}–{away_k} → {actual}", actual == hint)
+        options = [("HOME", home_name), ("DRAW", "draw"), ("AWAY", away_name)]
+        return ((0, 0), "3-way", _cells(options, actual), _verdict(actual))
 
-    return {"line": "—", "actual": "—", "verdict": "unsupported"}
-
-
-def _hint_results_table(rows: list[dict]) -> str:
-    """Render verified hints as an HTML table. Incorrect rows scream in bright
-    red; correct rows are a bland green; not-reached/push/unsupported are gray."""
-    parts = [
-        f"<div style='background:{_IM_CARD_BG};border:1px solid {_IM_BORDER};"
-        f"border-radius:6px;overflow:hidden;margin-top:6px;'>"
-        f"<table style='width:100%;border-collapse:collapse;font-size:0.8rem;'>"
-        f"<tr style='background:{_IM_HEADER_BG};color:{_IM_TEXT};font-weight:600;'>"
-        + "".join(
-            f"<td style='padding:6px 10px;'>{h}</td>"
-            for h in ("Interval", "Market", "Line", "Hint", "Replay says", "Verdict")
-        )
-        + "</tr>"
-    ]
-    for r in rows:
-        verdict = r["verdict"]
-        if verdict == "wrong":
-            bg, color, weight = _HINT_WRONG_BG, "#ffffff", "700"
-            verdict_label = "✘ WRONG"
-        elif verdict == "correct":
-            bg, color, weight = _HINT_OK_BG, _HINT_OK_TEXT, "400"
-            verdict_label = "✔ correct"
-        else:
-            bg, color, weight = _HINT_VOID_BG, _HINT_VOID_TEXT, "400"
-            verdict_label = {
-                "push": "push",
-                "not_reached": "not reached",
-                "unsupported": "unreadable hint",
-            }.get(verdict, verdict)
-        cells = (r["interval"], r["market"], r["line"], r["hint"], r["actual"], verdict_label)
-        parts.append(
-            f"<tr style='background:{bg};color:{color};font-weight:{weight};'>"
-            + "".join(
-                f"<td style='padding:6px 10px;border-bottom:2px solid {_IM_CARD_BG};'>{c}</td>"
-                for c in cells
-            )
-            + "</tr>"
-        )
-    parts.append("</table></div>")
-    return "".join(parts)
+    return None
 
 
 def _render_hint_checker(
@@ -1671,10 +1687,14 @@ def _render_hint_checker(
     home_is_radiant: bool,
     last_idx: int,
     duration: int,
+    home_name: str,
+    away_name: str,
 ) -> None:
     """Paste-box that cross-checks Dotabuff interval-market hints against the
-    replay-derived interval kills. Only interval markets are verified; every
-    other market in the paste is ignored."""
+    replay-derived interval kills, rendered as a second set of interval market
+    cards showing only the pasted (active) markets. Only interval markets are
+    verified; every other market in the paste is ignored, and hints for
+    intervals the game never reached are skipped entirely."""
     st.markdown("### Verify Dotabuff hints")
     raw = st.text_area(
         "Paste the hint export here (only Map Interval markets are checked; everything else is ignored)",
@@ -1723,67 +1743,109 @@ def _render_hint_checker(
             key=f"hint_map_order_{match_id}",
         )
 
-    rows = []
+    # Group verifiable hints per interval → per market. Not-reached intervals
+    # are skipped entirely; unreadable hints and pushes are only counted.
+    per_interval: dict[int, dict[str, list]] = {}
+    counts = {"wrong": 0, "correct": 0, "push": 0}
+    not_reached = 0
+    unreadable = 0
+    seen: set[tuple] = set()
     for label, e in interval_entries:
         params = e.get("params") or {}
         if map_order is not None and params.get("mapOrder") not in (None, map_order):
             continue
         idx = _parse_interval_param(params.get("interval"))
-        hint = str(e.get("hint", "")).strip().upper()
         if idx is None:
-            rows.append({
-                "interval": str(params.get("interval", "?")), "interval_idx": 99,
-                "market": label, "line": "—", "hint": hint,
-                "actual": "—", "verdict": "unsupported",
-            })
+            unreadable += 1
             continue
-
-        interval_label = f"{idx * 10}-{(idx + 1) * 10}"
         if idx > last_idx:
-            rows.append({
-                "interval": interval_label, "interval_idx": idx,
-                "market": label, "line": "—", "hint": hint,
-                "actual": f"game ended {_fmt_clock(duration)}", "verdict": "not_reached",
-            })
+            not_reached += 1
             continue
 
         bucket = intervals[idx]
         home_k = bucket["radiant_kills"] if home_is_radiant else bucket["dire_kills"]
         away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
-        result = _evaluate_interval_hint(label, e, home_k, away_k)
-        if idx == last_idx and duration < (idx + 1) * INTERVAL_SECONDS:
-            interval_label += " ⚠ partial"
-        rows.append({
-            "interval": interval_label, "interval_idx": idx,
-            "market": label, "line": result["line"], "hint": hint,
-            "actual": result["actual"], "verdict": result["verdict"],
-        })
+        row = _hint_card_row(label, e, home_k, away_k, home_name, away_name)
+        if row is None:
+            unreadable += 1
+            continue
+        sort_key, row_label, cells, verdict = row
+        dedupe_key = (idx, label, row_label, str(e.get("hint", "")).strip().upper())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        counts[verdict] += 1
+        per_interval.setdefault(idx, {}).setdefault(label, []).append((sort_key, row_label, cells))
 
-    if not rows:
-        st.warning("No interval-market hints match the selected mapOrder.")
+    if not per_interval:
+        st.warning(
+            "No verifiable interval-market hints for this map "
+            f"({not_reached} not reached · {unreadable} unreadable · {ignored} non-interval ignored)."
+        )
         return
 
-    n_wrong = sum(1 for r in rows if r["verdict"] == "wrong")
-    n_ok = sum(1 for r in rows if r["verdict"] == "correct")
-    n_other = len(rows) - n_wrong - n_ok
-
-    summary = f"**{n_wrong} incorrect** · {n_ok} correct · {n_other} not reached/push/unreadable"
+    summary = f"**{counts['wrong']} incorrect** · {counts['correct']} correct"
+    if counts["push"]:
+        summary += f" · {counts['push']} push"
+    skipped_bits = []
+    if not_reached:
+        skipped_bits.append(f"{not_reached} not-reached hint(s) skipped")
+    if unreadable:
+        skipped_bits.append(f"{unreadable} unreadable")
     if ignored:
-        summary += f" · {ignored} non-interval hint(s) ignored"
-    if n_wrong:
+        skipped_bits.append(f"{ignored} non-interval ignored")
+    if skipped_bits:
+        summary += " · " + " · ".join(skipped_bits)
+    if counts["wrong"]:
         st.error(summary)
     else:
         st.success(summary)
+    st.markdown(
+        f"{_chip('red = wrong hint', _HINT_WRONG_BG)} · "
+        f"{_chip('green = correct hint', '#4f9d77')} · "
+        f"{_chip('yellow = what actually won', _HINT_EXPECTED_BG)}",
+        unsafe_allow_html=True,
+    )
 
-    verdict_rank = {"wrong": 0, "correct": 1, "push": 2, "not_reached": 3, "unsupported": 4}
-    market_rank = {m: i for i, m in enumerate(_HINT_MARKET_ORDER)}
-    rows.sort(key=lambda r: (
-        verdict_rank.get(r["verdict"], 9),
-        r["interval_idx"],
-        market_rank.get(r["market"], 9),
-        str(r["line"]),
-    ))
-    st.markdown(_hint_results_table(rows), unsafe_allow_html=True)
+    shown = sorted(per_interval)
+    PER_ROW = 4
+    for chunk_start in range(0, len(shown), PER_ROW):
+        chunk = shown[chunk_start:chunk_start + PER_ROW]
+        cols = st.columns(PER_ROW, gap="medium")
+        for col, idx in zip(cols, chunk):
+            bucket = intervals[idx]
+            home_k = bucket["radiant_kills"] if home_is_radiant else bucket["dire_kills"]
+            away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
+
+            header = f"Interval {idx * 10}-{(idx + 1) * 10}"
+            is_partial = (
+                idx == last_idx
+                and duration < (idx + 1) * INTERVAL_SECONDS
+                and duration < MAX_INTERVALS * INTERVAL_SECONDS
+            )
+            sub = f"partial — game ended {_fmt_clock(duration)}" if is_partial else None
+
+            with col:
+                st.markdown(f"#### {header}")
+                if sub:
+                    st.caption(sub)
+                st.markdown(
+                    f"{_chip(f'{home_name} {home_k}', HOME_UNDER_COLOR)} — "
+                    f"{_chip(f'{away_name} {away_k}', AWAY_OVER_COLOR)} "
+                    f"({home_k + away_k} total)",
+                    unsafe_allow_html=True,
+                )
+                html = []
+                for market_label in _HINT_MARKET_ORDER:
+                    market_rows = per_interval[idx].get(market_label)
+                    if not market_rows:
+                        continue
+                    market_rows.sort(key=lambda r: r[0])
+                    html.append(_im_card(
+                        _HINT_CARD_TITLES[market_label],
+                        [(row_label, cells) for _, row_label, cells in market_rows],
+                    ))
+                st.markdown("".join(html), unsafe_allow_html=True)
 
 
 def render_interval_markets(data: dict) -> None:
@@ -1877,6 +1939,8 @@ def render_interval_markets(data: dict) -> None:
         home_is_radiant,
         last_idx,
         duration,
+        home_name,
+        away_name,
     )
 
 
