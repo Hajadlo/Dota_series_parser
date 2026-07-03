@@ -60,6 +60,13 @@ load_local_env()
 RADIANT_COLOR = "#4caf50"
 DIRE_COLOR = "#e05c5c"
 
+# Interval-market colours (trader convention: Home & Under = blue, Away & Over = orange)
+HOME_UNDER_COLOR = "#4c8bf5"
+AWAY_OVER_COLOR = "#ff9800"
+
+# Interval markets are defined for game-clock windows [0-10), [10-20), ... [80-90).
+INTERVAL_SECONDS = 600
+MAX_INTERVALS = 9  # 0-10 .. 80-90
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -783,6 +790,62 @@ def analyse_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
     }
 
 
+def analyse_interval_kills(kills: list[dict], total_expected_kills: int = 0) -> dict:
+    """Bucket countable hero kills into 10-minute game-clock intervals.
+
+    Interval semantics (interval markets spec):
+      * Interval i covers game clock [i*600, (i+1)*600) seconds — i.e. 0-10 is
+        0:00.000 up to but excluding 10:00.000 (a kill at exactly 10:00 belongs
+        to 10-20).
+      * Pre-horn kills (negative game clock) are EXCLUDED from every interval,
+        but still consume the authoritative-total cap (they are real match kills).
+      * Kills at/after 90:00 belong to no interval (markets only defined to 90).
+
+    Uses the same countable-kill walk and phantom-kill cap as analyse_kills(),
+    so interval sums always reconcile with the headline kill counts.
+
+    Returns {
+      "intervals": [{"radiant_kills": int, "dire_kills": int}] * 9,
+      "pre_horn_kills": int,   # countable kills before 0:00, excluded from intervals
+      "post_90_kills": int,    # countable kills at/after 90:00, excluded from intervals
+      "last_kill_time": float, # game-clock time of last counted kill (fallback when duration missing)
+    }
+    """
+    intervals = [{"radiant_kills": 0, "dire_kills": 0} for _ in range(MAX_INTERVALS)]
+    pre_horn = 0
+    post_90 = 0
+    last_kill_time = 0.0
+    total_k = 0
+
+    for k in kills:
+        if not is_countable_hero_kill(k):
+            continue
+        total_k += 1
+        t = float(k.get("time_f", k.get("time", 0)))
+        last_kill_time = max(last_kill_time, t)
+        if t < 0:
+            pre_horn += 1
+        elif t >= MAX_INTERVALS * INTERVAL_SECONDS:
+            post_90 += 1
+        else:
+            idx = int(t // INTERVAL_SECONDS)
+            if k.get("killer_team", 0) == 2:
+                intervals[idx]["radiant_kills"] += 1
+            else:
+                intervals[idx]["dire_kills"] += 1
+
+        # Same phantom-kill guard as analyse_kills(): stop at the authoritative total.
+        if total_expected_kills > 0 and total_k >= total_expected_kills:
+            break
+
+    return {
+        "intervals": intervals,
+        "pre_horn_kills": pre_horn,
+        "post_90_kills": post_90,
+        "last_kill_time": last_kill_time,
+    }
+
+
 def analyse_special_events(events: list[dict]) -> dict:
     """
     Scan sorted events for first tower death, first barracks death, first Aegis pickup,
@@ -952,6 +1015,7 @@ def process_match(match_id: str, replay_url_override: str | None = None) -> dict
     milestones["radiant_roshans"] = special["radiant_roshans"]
     milestones["dire_roshans"] = special["dire_roshans"]
     milestones["first_tormentor"] = special["first_tormentor"]
+    milestones["interval_kills"] = analyse_interval_kills(kills, radiant_score + dire_score)
 
     return {
         "match_id": match_id,
@@ -1154,6 +1218,9 @@ def render_match_analysis(data: dict) -> None:
             unsafe_allow_html=True,
         )
 
+    # ── Interval markets ───────────────────────────────────────────────────────
+    render_interval_markets(data)
+
     # ── Debug: raw kill events ─────────────────────────────────────────────────
     raw_kills = data.get("raw_kills", [])
     expected = data.get("total_expected_kills", 0)
@@ -1269,6 +1336,548 @@ def render_match_analysis(data: dict) -> None:
                 })
 
             st.dataframe(rows, use_container_width=True)
+
+
+# ── Interval markets rendering ─────────────────────────────────────────────────
+
+def _fmt_clock(secs: float) -> str:
+    s = int(secs)
+    sign = "-" if s < 0 else ""
+    s = abs(s)
+    return f"{sign}{s // 60}:{s % 60:02d}"
+
+
+def _chip(text: str, color: str) -> str:
+    return f"<span style='color:{color};font-weight:600'>{text}</span>"
+
+
+# Dark card palette mimicking the resolving tool (winner cell = green).
+_IM_CARD_BG = "#141b26"
+_IM_BORDER = "#2c3a4a"
+_IM_HEADER_BG = "#22303f"
+_IM_LABEL_BG = "#101720"
+_IM_CELL_BG = "#2a3949"
+_IM_WIN_BG = "#2e6b50"
+_IM_TEXT = "#c9d4e0"
+_IM_DIM = "#93a4b5"
+
+
+def _im_card(title: str, rows: list[tuple[str, list[tuple[str, bool]]]]) -> str:
+    """Build an HTML market card that mimics the trading tool's resolving view:
+    a dark card with a header bar, one row per line, the line value in the
+    left label column, one cell per selection, winner highlighted green.
+
+    rows: [(label, [(selection_text, is_winner), ...]), ...]
+    """
+    parts = [
+        f"<div style='background:{_IM_CARD_BG};border:1px solid {_IM_BORDER};"
+        f"border-radius:6px;overflow:hidden;margin-bottom:10px;'>"
+        f"<div style='background:{_IM_HEADER_BG};padding:5px 10px;color:{_IM_TEXT};"
+        f"font-weight:600;font-size:0.8rem;'>{title}</div>"
+        f"<table style='width:100%;border-collapse:collapse;font-size:0.78rem;'>"
+    ]
+    for label, cells in rows:
+        parts.append("<tr>")
+        parts.append(
+            f"<td style='background:{_IM_LABEL_BG};color:{_IM_TEXT};padding:6px 8px;"
+            f"width:26%;border-bottom:2px solid {_IM_CARD_BG};white-space:nowrap;"
+            f"font-weight:600;'>{label}</td>"
+        )
+        for text, won in cells:
+            bg = _IM_WIN_BG if won else _IM_CELL_BG
+            color = "#eaf5ee" if won else _IM_DIM
+            weight = "600" if won else "400"
+            parts.append(
+                f"<td style='background:{bg};color:{color};padding:6px 8px;"
+                f"text-align:center;font-weight:{weight};"
+                f"border-bottom:2px solid {_IM_CARD_BG};"
+                f"border-left:2px solid {_IM_CARD_BG};'>{text}</td>"
+            )
+        parts.append("</tr>")
+    parts.append("</table></div>")
+    return "".join(parts)
+
+
+def _ou_rows(result: int, label_suffix: str = "") -> list[tuple[str, list[tuple[str, bool]]]]:
+    """The 4 half-kill O/U lines around `result` as card rows (under | over).
+
+    Lines below the result settle Over, above settle Under. Lines below the
+    minimum book line (0.5) do not exist and are dropped.
+    """
+    rows = []
+    for off in (-1.5, -0.5, 0.5, 1.5):
+        line = result + off
+        if line < 0.5:
+            continue
+        rows.append((
+            f"{line:g}{label_suffix}",
+            [("under", line > result), ("over", line < result)],
+        ))
+    return rows
+
+
+def _handicap_rows(
+    margin: int, home_name: str, away_name: str
+) -> list[tuple[str, list[tuple[str, bool]]]]:
+    """The 4 handicap lines around the split, from the HOME perspective.
+
+    A line L (applied to Home) settles Home when margin + L > 0. The split
+    sits at L = -margin. Rows are ordered top-down like the trading tool
+    (line closest to even first).
+    """
+    split = -margin
+    rows = []
+    for line in (split + 1.5, split + 0.5, split - 0.5, split - 1.5):
+        home_wins = margin + line > 0
+        rows.append((
+            f"{line:+g}",
+            [(home_name, home_wins), (away_name, not home_wins)],
+        ))
+    return rows
+
+
+def _render_interval_cards(
+    header: str,
+    sub: str | None,
+    home_k: int,
+    away_k: int,
+    home_name: str,
+    away_name: str,
+) -> None:
+    """Render one interval as a vertical stack of the 5 market cards."""
+    total = home_k + away_k
+    margin = home_k - away_k
+
+    st.markdown(f"#### {header}")
+    if sub:
+        st.caption(sub)
+    st.markdown(
+        f"{_chip(f'{home_name} {home_k}', HOME_UNDER_COLOR)} — "
+        f"{_chip(f'{away_name} {away_k}', AWAY_OVER_COLOR)} ({total} total)",
+        unsafe_allow_html=True,
+    )
+
+    html = [
+        _im_card("Total Kills", _ou_rows(total)),
+        _im_card("Kills Handicap", _handicap_rows(margin, home_name, away_name)),
+        _im_card("Team Total Kills", _ou_rows(home_k, ", home") + _ou_rows(away_k, ", away")),
+        _im_card(
+            "Total Kills Parity",
+            [(str(total), [("odd", total % 2 == 1), ("even", total % 2 == 0)])],
+        ),
+        _im_card(
+            "Kills Winner (3-way)",
+            [("3-way", [(home_name, margin > 0), ("draw", margin == 0), (away_name, margin < 0)])],
+        ),
+    ]
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+# ── Interval-market hint verification (Dotabuff copypaste) ────────────────────
+
+_HINT_WRONG_BG = "#ff1744"   # VERY bright red — these are what the trader must catch
+_HINT_OK_BG = "#1e4636"      # bland green — correct hints, low visual priority
+_HINT_OK_TEXT = "#7fae97"
+_HINT_VOID_BG = "#2a3441"    # neutral — not reached / push / unsupported
+_HINT_VOID_TEXT = "#8fa1b3"
+
+# Only these markets are verified — every other marketName in the paste is ignored.
+_INTERVAL_HINT_MARKETS = {
+    "map interval total kills": "Total Kills",
+    "map interval team total kills": "Team Total Kills",
+    "map interval kills handicap": "Kills Handicap",
+    "map interval total kills parity": "Parity",
+    "map interval kills winner": "Winner",
+}
+_HINT_MARKET_ORDER = ["Total Kills", "Kills Handicap", "Team Total Kills", "Parity", "Winner"]
+
+
+def _parse_hint_paste(raw: str) -> tuple[list[dict], bool]:
+    """Parse the pasted hint blob. Returns (entries, recovered).
+
+    Tries strict JSON first. Dotabuff copypastes are often truncated mid-array,
+    so on failure fall back to extracting every balanced top-level {...} object
+    (recovered=True signals the paste was not clean JSON).
+    """
+    raw = raw.strip()
+    if not raw:
+        return [], False
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            return [e for e in parsed if isinstance(e, dict)], False
+    except json.JSONDecodeError:
+        pass
+
+    entries: list[dict] = []
+    depth = 0
+    start: int | None = None
+    in_str = False
+    escape = False
+    for i, ch in enumerate(raw):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(raw[start:i + 1])
+                    if isinstance(obj, dict):
+                        entries.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    # Keep only top-level hint objects, not nested params dicts.
+    entries = [e for e in entries if "marketName" in e]
+    return entries, True
+
+
+def _parse_interval_param(value) -> int | None:
+    """'0-10' / '00-10' / '80-90' → interval index 0..8, else None."""
+    m = re.fullmatch(r"\s*0*(\d{1,2})\s*-\s*0*(\d{1,2})\s*", str(value or ""))
+    if not m:
+        return None
+    start, end = int(m.group(1)), int(m.group(2))
+    if end - start != 10 or start % 10 != 0 or start >= MAX_INTERVALS * 10:
+        return None
+    return start // 10
+
+
+def _evaluate_interval_hint(market_label: str, entry: dict, home_k: int, away_k: int) -> dict:
+    """Resolve one interval-market hint against replay kills for its interval.
+
+    Returns {line, actual, verdict} with verdict in
+    'correct' | 'wrong' | 'push' | 'unsupported'.
+    """
+    params = entry.get("params") or {}
+    hint = str(entry.get("hint", "")).strip().upper()
+    total = home_k + away_k
+    margin = home_k - away_k
+
+    def _outcome(actual: str, correct: bool | None, line: str = "—") -> dict:
+        verdict = "push" if correct is None else ("correct" if correct else "wrong")
+        return {"line": line, "actual": actual, "verdict": verdict}
+
+    if market_label == "Total Kills":
+        threshold = params.get("threshold")
+        if not isinstance(threshold, (int, float)) or hint not in ("OVER", "UNDER"):
+            return {"line": str(threshold), "actual": "—", "verdict": "unsupported"}
+        if total == threshold:
+            return _outcome(f"{total} kills → PUSH", None, f"{threshold:g}")
+        actual = "OVER" if total > threshold else "UNDER"
+        return _outcome(f"{total} kills → {actual}", actual == hint, f"{threshold:g}")
+
+    if market_label == "Team Total Kills":
+        threshold = params.get("threshold")
+        side = str(params.get("side") or params.get("team") or "").strip().upper()
+        if (
+            not isinstance(threshold, (int, float))
+            or side not in ("HOME", "AWAY")
+            or hint not in ("OVER", "UNDER")
+        ):
+            return {"line": str(threshold), "actual": "—", "verdict": "unsupported"}
+        kills = home_k if side == "HOME" else away_k
+        line = f"{threshold:g}, {side.lower()}"
+        if kills == threshold:
+            return _outcome(f"{side.lower()} {kills} → PUSH", None, line)
+        actual = "OVER" if kills > threshold else "UNDER"
+        return _outcome(f"{side.lower()} {kills} → {actual}", actual == hint, line)
+
+    if market_label == "Kills Handicap":
+        handicap = params.get("handicap")
+        if not isinstance(handicap, (int, float)) or hint not in ("HOME", "AWAY"):
+            return {"line": str(handicap), "actual": "—", "verdict": "unsupported"}
+        adj = margin + handicap  # handicap applied to Home
+        if adj == 0:
+            return _outcome(f"margin {margin:+d} → PUSH", None, f"{handicap:+g}")
+        actual = "HOME" if adj > 0 else "AWAY"
+        return _outcome(f"margin {margin:+d} → {actual}", actual == hint, f"{handicap:+g}")
+
+    if market_label == "Parity":
+        if hint not in ("ODD", "EVEN"):
+            return {"line": "—", "actual": "—", "verdict": "unsupported"}
+        actual = "EVEN" if total % 2 == 0 else "ODD"
+        return _outcome(f"{total} kills → {actual}", actual == hint)
+
+    if market_label == "Winner":
+        if hint not in ("HOME", "AWAY", "DRAW"):
+            return {"line": "—", "actual": "—", "verdict": "unsupported"}
+        actual = "HOME" if margin > 0 else ("AWAY" if margin < 0 else "DRAW")
+        return _outcome(f"{home_k}–{away_k} → {actual}", actual == hint)
+
+    return {"line": "—", "actual": "—", "verdict": "unsupported"}
+
+
+def _hint_results_table(rows: list[dict]) -> str:
+    """Render verified hints as an HTML table. Incorrect rows scream in bright
+    red; correct rows are a bland green; not-reached/push/unsupported are gray."""
+    parts = [
+        f"<div style='background:{_IM_CARD_BG};border:1px solid {_IM_BORDER};"
+        f"border-radius:6px;overflow:hidden;margin-top:6px;'>"
+        f"<table style='width:100%;border-collapse:collapse;font-size:0.8rem;'>"
+        f"<tr style='background:{_IM_HEADER_BG};color:{_IM_TEXT};font-weight:600;'>"
+        + "".join(
+            f"<td style='padding:6px 10px;'>{h}</td>"
+            for h in ("Interval", "Market", "Line", "Hint", "Replay says", "Verdict")
+        )
+        + "</tr>"
+    ]
+    for r in rows:
+        verdict = r["verdict"]
+        if verdict == "wrong":
+            bg, color, weight = _HINT_WRONG_BG, "#ffffff", "700"
+            verdict_label = "✘ WRONG"
+        elif verdict == "correct":
+            bg, color, weight = _HINT_OK_BG, _HINT_OK_TEXT, "400"
+            verdict_label = "✔ correct"
+        else:
+            bg, color, weight = _HINT_VOID_BG, _HINT_VOID_TEXT, "400"
+            verdict_label = {
+                "push": "push",
+                "not_reached": "not reached",
+                "unsupported": "unreadable hint",
+            }.get(verdict, verdict)
+        cells = (r["interval"], r["market"], r["line"], r["hint"], r["actual"], verdict_label)
+        parts.append(
+            f"<tr style='background:{bg};color:{color};font-weight:{weight};'>"
+            + "".join(
+                f"<td style='padding:6px 10px;border-bottom:2px solid {_IM_CARD_BG};'>{c}</td>"
+                for c in cells
+            )
+            + "</tr>"
+        )
+    parts.append("</table></div>")
+    return "".join(parts)
+
+
+def _render_hint_checker(
+    match_id: str,
+    intervals: list[dict],
+    home_is_radiant: bool,
+    last_idx: int,
+    duration: int,
+) -> None:
+    """Paste-box that cross-checks Dotabuff interval-market hints against the
+    replay-derived interval kills. Only interval markets are verified; every
+    other market in the paste is ignored."""
+    st.markdown("### Verify Dotabuff hints")
+    raw = st.text_area(
+        "Paste the hint export here (only Map Interval markets are checked; everything else is ignored)",
+        key=f"hint_paste_{match_id}",
+        height=170,
+        placeholder='[\n  {\n    "marketName": "Map Interval Kills Handicap",\n    "hint": "HOME",\n    "params": { "mapOrder": 1, "handicap": -12.5, "interval": "0-10" }\n  },\n  ...\n]',
+    )
+    if not raw.strip():
+        return
+
+    entries, recovered = _parse_hint_paste(raw)
+    if not entries:
+        st.error("Could not read any hint objects from the paste.")
+        return
+    if recovered:
+        st.caption(
+            f"Paste was not clean JSON (probably truncated) — recovered {len(entries)} hint object(s)."
+        )
+
+    interval_entries = []
+    ignored = 0
+    for e in entries:
+        key = re.sub(r"\s+", " ", str(e.get("marketName", "")).strip().lower())
+        label = _INTERVAL_HINT_MARKETS.get(key)
+        if label is None:
+            ignored += 1
+        else:
+            interval_entries.append((label, e))
+
+    if not interval_entries:
+        st.warning(f"No interval-market hints found in the paste ({ignored} other hint(s) ignored).")
+        return
+
+    map_orders = sorted(
+        {
+            (e.get("params") or {}).get("mapOrder")
+            for _, e in interval_entries
+            if isinstance((e.get("params") or {}).get("mapOrder"), int)
+        }
+    )
+    map_order = map_orders[0] if map_orders else None
+    if len(map_orders) > 1:
+        map_order = st.selectbox(
+            "The paste contains several maps — which mapOrder is THIS replay?",
+            map_orders,
+            key=f"hint_map_order_{match_id}",
+        )
+
+    rows = []
+    for label, e in interval_entries:
+        params = e.get("params") or {}
+        if map_order is not None and params.get("mapOrder") not in (None, map_order):
+            continue
+        idx = _parse_interval_param(params.get("interval"))
+        hint = str(e.get("hint", "")).strip().upper()
+        if idx is None:
+            rows.append({
+                "interval": str(params.get("interval", "?")), "interval_idx": 99,
+                "market": label, "line": "—", "hint": hint,
+                "actual": "—", "verdict": "unsupported",
+            })
+            continue
+
+        interval_label = f"{idx * 10}-{(idx + 1) * 10}"
+        if idx > last_idx:
+            rows.append({
+                "interval": interval_label, "interval_idx": idx,
+                "market": label, "line": "—", "hint": hint,
+                "actual": f"game ended {_fmt_clock(duration)}", "verdict": "not_reached",
+            })
+            continue
+
+        bucket = intervals[idx]
+        home_k = bucket["radiant_kills"] if home_is_radiant else bucket["dire_kills"]
+        away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
+        result = _evaluate_interval_hint(label, e, home_k, away_k)
+        if idx == last_idx and duration < (idx + 1) * INTERVAL_SECONDS:
+            interval_label += " ⚠ partial"
+        rows.append({
+            "interval": interval_label, "interval_idx": idx,
+            "market": label, "line": result["line"], "hint": hint,
+            "actual": result["actual"], "verdict": result["verdict"],
+        })
+
+    if not rows:
+        st.warning("No interval-market hints match the selected mapOrder.")
+        return
+
+    n_wrong = sum(1 for r in rows if r["verdict"] == "wrong")
+    n_ok = sum(1 for r in rows if r["verdict"] == "correct")
+    n_other = len(rows) - n_wrong - n_ok
+
+    summary = f"**{n_wrong} incorrect** · {n_ok} correct · {n_other} not reached/push/unreadable"
+    if ignored:
+        summary += f" · {ignored} non-interval hint(s) ignored"
+    if n_wrong:
+        st.error(summary)
+    else:
+        st.success(summary)
+
+    verdict_rank = {"wrong": 0, "correct": 1, "push": 2, "not_reached": 3, "unsupported": 4}
+    market_rank = {m: i for i, m in enumerate(_HINT_MARKET_ORDER)}
+    rows.sort(key=lambda r: (
+        verdict_rank.get(r["verdict"], 9),
+        r["interval_idx"],
+        market_rank.get(r["market"], 9),
+        str(r["line"]),
+    ))
+    st.markdown(_hint_results_table(rows), unsafe_allow_html=True)
+
+
+def render_interval_markets(data: dict) -> None:
+    """Render the Interval Markets section (5 markets per 10-minute interval).
+
+    The user must pick which team is Home before any resolution is shown —
+    there is deliberately no Radiant=Home default.
+    """
+    m = data.get("milestones") or {}
+    interval_data = m.get("interval_kills")
+    if not interval_data:
+        return
+
+    rn = data["radiant_name"]
+    dn = data["dire_name"]
+
+    st.divider()
+    st.markdown("## Interval Markets")
+    st.caption(
+        "10-minute game-clock windows (0-10 = 0:00-9:59, 10-20 = 10:00-19:59, ...). "
+        "Pre-horn kills (negative clock) are excluded."
+    )
+
+    radiant_label = f"{rn} (Radiant)"
+    dire_label = f"{dn} (Dire)"
+    choice = st.radio(
+        "Which team is **Home**?",
+        [radiant_label, dire_label],
+        index=None,
+        horizontal=True,
+        key=f"home_team_{data['match_id']}",
+    )
+    if choice is None:
+        st.info("Select the Home team above to reveal interval market resolutions.")
+        return
+    home_is_radiant = choice == radiant_label
+
+    home_name, away_name = (rn, dn) if home_is_radiant else (dn, rn)
+    st.markdown(
+        f"{_chip(f'Home = {home_name}', HOME_UNDER_COLOR)} · "
+        f"{_chip(f'Away = {away_name}', AWAY_OVER_COLOR)} — "
+        "green cell = winning selection · handicap lines are from the Home perspective",
+        unsafe_allow_html=True,
+    )
+
+    pre_horn = interval_data.get("pre_horn_kills", 0)
+    if pre_horn:
+        st.caption(f"{pre_horn} pre-horn kill(s) excluded from all intervals.")
+    post_90 = interval_data.get("post_90_kills", 0)
+    if post_90:
+        st.warning(
+            f"{post_90} kill(s) at/after 90:00 ignored — interval markets are only defined up to 90."
+        )
+
+    duration = int(data.get("duration", 0))
+    if duration <= 0:
+        # Duration missing from the API — fall back to the last counted kill.
+        duration = int(interval_data.get("last_kill_time", 0)) + 1
+
+    max_span = MAX_INTERVALS * INTERVAL_SECONDS
+    last_idx = min((max(duration - 1, 0)) // INTERVAL_SECONDS, MAX_INTERVALS - 1)
+
+    intervals = interval_data["intervals"]
+    shown = list(range(last_idx + 1))
+
+    # Lay intervals out horizontally, up to 4 per row, so traders can scan
+    # across the game the same way the resolving tool lists markets.
+    PER_ROW = 4
+    for chunk_start in range(0, len(shown), PER_ROW):
+        chunk = shown[chunk_start:chunk_start + PER_ROW]
+        cols = st.columns(PER_ROW, gap="medium")
+        for col, idx in zip(cols, chunk):
+            bucket = intervals[idx]
+            home_k = bucket["radiant_kills"] if home_is_radiant else bucket["dire_kills"]
+            away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
+
+            header = f"Interval {idx * 10}-{(idx + 1) * 10}"
+            is_partial = (
+                idx == last_idx
+                and duration < (idx + 1) * INTERVAL_SECONDS
+                and duration < max_span
+            )
+            sub = f"partial — game ended {_fmt_clock(duration)}" if is_partial else None
+
+            with col:
+                _render_interval_cards(header, sub, home_k, away_k, home_name, away_name)
+
+    _render_hint_checker(
+        data["match_id"],
+        intervals,
+        home_is_radiant,
+        last_idx,
+        duration,
+    )
 
 
 # ── Session state defaults ─────────────────────────────────────────────────────
