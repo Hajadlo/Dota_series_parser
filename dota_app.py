@@ -1391,7 +1391,8 @@ def _im_card(title: str, rows: list[tuple[str, list[tuple[str, str]]]]) -> str:
         f"border-radius:6px;overflow:hidden;margin-bottom:10px;'>"
         f"<div style='background:{_IM_HEADER_BG};padding:5px 10px;color:{_IM_TEXT};"
         f"font-weight:600;font-size:0.8rem;'>{title}</div>"
-        f"<table style='width:100%;border-collapse:collapse;font-size:0.78rem;'>"
+        f"<table style='width:100%;border-collapse:collapse;font-size:0.78rem;"
+        f"table-layout:fixed;'>"
     ]
     for label, cells in rows:
         parts.append("<tr>")
@@ -1404,7 +1405,7 @@ def _im_card(title: str, rows: list[tuple[str, list[tuple[str, str]]]]) -> str:
             bg, color, weight = _IM_CELL_STYLES.get(state, _IM_CELL_STYLES["off"])
             parts.append(
                 f"<td style='background:{bg};color:{color};padding:6px 8px;"
-                f"text-align:center;font-weight:{weight};"
+                f"text-align:center;font-weight:{weight};overflow-wrap:break-word;"
                 f"border-bottom:2px solid {_IM_CARD_BG};"
                 f"border-left:2px solid {_IM_CARD_BG};'>{text}</td>"
             )
