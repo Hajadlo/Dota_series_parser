@@ -15,6 +15,7 @@ from dota2.client import Dota2Client
 from gevent.event import AsyncResult
 from steam.client import SteamClient
 from steam.enums import EResult
+from steam.enums.emsg import EMsg
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Dota 2 Series Analyzer", layout="wide")
@@ -60,6 +61,7 @@ RADIANT_COLOR = "#4caf50"
 DIRE_COLOR = "#e05c5c"
 
 
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def towers_from_status(tower_status: int) -> int:
@@ -74,7 +76,19 @@ def parse_match_id(url: str) -> str | None:
     if raw.isdigit():
         return raw
     m = re.search(r"/matches/(\d+)", raw)
+    if m:
+        return m.group(1)
+    m = re.search(r"/570/(\d+)_\d+\.dem\.bz2", raw)
     return m.group(1) if m else None
+
+
+def parse_valve_replay_url(url: str) -> tuple[str, str] | None:
+    """Return (match_id, replay_url) when the input is a direct Valve replay URL."""
+    raw = url.strip()
+    m = re.search(r"https?://replay\d+\.valve\.net/570/(\d+)_\d+\.dem\.bz2", raw)
+    if not m:
+        return None
+    return m.group(1), raw
 
 
 _SECRET_QUERY_PARAM_RE = re.compile(
@@ -236,10 +250,30 @@ def fetch_gc_match_details(match_id: str) -> dict:
     os.makedirs(sentry_dir, exist_ok=True)
     steam_client.set_credential_location(sentry_dir)
     response = AsyncResult()
+    requested = {"done": False}
+
+    def _request_match_details_once():
+        if requested["done"] or response.ready():
+            return
+        requested["done"] = True
+        dota_client.request_match_details(int(match_id))
 
     @steam_client.on("logged_on")
     def _on_logged_on():
+        # Start the Dota GC handshake as soon as Steam login completes. We also
+        # call launch() after spawning run_forever below, because steam-client
+        # can emit logged_on before the greenlet is fully pumping messages.
         dota_client.launch()
+
+    @steam_client.on("disconnected")
+    def _on_disconnected():
+        if not response.ready():
+            response.set(("steam_disconnected", None, None))
+
+    @steam_client.on(EMsg.ClientLoggedOff)
+    def _on_logged_off(_msg):
+        if not response.ready():
+            response.set(("steam_logged_off", None, None))
 
     @steam_client.on("error")
     def _on_steam_error(result):
@@ -248,7 +282,7 @@ def fetch_gc_match_details(match_id: str) -> dict:
 
     @dota_client.on("ready")
     def _on_gc_ready():
-        dota_client.request_match_details(int(match_id))
+        _request_match_details_once()
 
     @dota_client.on("match_details")
     def _on_match_details(returned_match_id, eresult, match):
@@ -261,7 +295,12 @@ def fetch_gc_match_details(match_id: str) -> dict:
 
     runner = gevent.spawn(steam_client.run_forever)
     try:
-        kind, status, match = response.get(timeout=45)
+        gevent.sleep(0.5)
+        dota_client.launch()
+        if dota_client.ready:
+            _request_match_details_once()
+
+        kind, status, match = response.get(timeout=75)
         if kind != "match_details" or status != EResult.OK or match is None:
             return {}
         return gc_match_to_dict(match)
@@ -814,7 +853,7 @@ def analyse_special_events(events: list[dict]) -> dict:
 
 # ── Full match pipeline ────────────────────────────────────────────────────────
 
-def process_match(match_id: str) -> dict:
+def process_match(match_id: str, replay_url_override: str | None = None) -> dict:
     """
     Fetch match data, download & parse replay, compute kill milestones.
     Returns everything needed for rendering.
@@ -879,11 +918,16 @@ def process_match(match_id: str) -> dict:
             "dire_megas": api_dire_megas,
         }
 
-    replay_url, replay_source, replay_err = resolve_replay_url(
-        match_id,
-        match,
-        queue_opendota_parse=True,
-    )
+    if replay_url_override:
+        replay_url = replay_url_override
+        replay_source = "Manual Valve replay URL"
+        replay_err = None
+    else:
+        replay_url, replay_source, replay_err = resolve_replay_url(
+            match_id,
+            match,
+            queue_opendota_parse=True,
+        )
     if not replay_url:
         return _basic_info(replay_err=replay_err)
 
@@ -1325,6 +1369,11 @@ if st.session_state.series_matches is not None:
     maps = st.session_state.series_matches
     if maps:
         st.markdown("**Select a map to analyze:**")
+        manual_replay_url = st.text_input(
+            "Optional direct Valve replay URL",
+            placeholder="http://replay273.valve.net/570/8822412074_<replay_salt>.dem.bz2",
+            help="Use this when Dotabuff has the replay but OpenDota has not published replay_salt yet. Paste the direct Valve replay link, then click that map.",
+        ).strip()
         btn_cols = st.columns(len(maps))
         for i, m in enumerate(maps):
             with btn_cols[i]:
@@ -1333,7 +1382,19 @@ if st.session_state.series_matches is not None:
                 if st.button(m["label"], type="primary" if is_primary else "secondary", key=f"map_btn_{m['match_id']}"):
                     try:
                         st.session_state.replay_retry_count = 0
-                        data = process_match(m["match_id"])
+                        replay_override = None
+                        if manual_replay_url:
+                            parsed_replay = parse_valve_replay_url(manual_replay_url)
+                            if not parsed_replay:
+                                st.error("The direct replay URL must look like http://replay273.valve.net/570/8822412074_<replay_salt>.dem.bz2")
+                                st.stop()
+                            replay_match_id, replay_override = parsed_replay
+                            if replay_match_id != str(m["match_id"]):
+                                st.error(
+                                    f"That replay URL is for match {replay_match_id}, but you clicked match {m['match_id']}."
+                                )
+                                st.stop()
+                        data = process_match(m["match_id"], replay_url_override=replay_override)
                         st.session_state.match_analysis = data
                         st.rerun()
                     except FileNotFoundError as exc:
