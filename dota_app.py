@@ -1065,9 +1065,11 @@ def analyse_special_events(events: list[dict]) -> dict:
     Tower totals   — radiant_towers = towers destroyed BY Radiant (Dire towers that fell).
                      dire_towers    = towers destroyed BY Dire   (Radiant towers that fell).
     Roshan totals  — radiant_roshans / dire_roshans by killer_team.
+    Tormentor totals — radiant_tormentors / dire_tormentors by killer_team.
 
     Returns dict with first_tower, first_barracks, first_aegis,
-    radiant_towers, dire_towers, radiant_roshans, dire_roshans.
+    radiant_towers, dire_towers, radiant_roshans, dire_roshans,
+    radiant_tormentors, dire_tormentors.
     """
     first_tower: dict | None = None
     first_barracks: dict | None = None
@@ -1077,6 +1079,8 @@ def analyse_special_events(events: list[dict]) -> dict:
     dire_towers = 0
     radiant_roshans = 0
     dire_roshans = 0
+    radiant_tormentors = 0
+    dire_tormentors = 0
 
     for e in events:
         etype = e.get("type")
@@ -1105,9 +1109,13 @@ def analyse_special_events(events: list[dict]) -> dict:
             elif kt == 3:
                 dire_roshans += 1
         elif etype == "tormentor":
+            kt = e.get("killer_team", 0)
             if first_tormentor is None:
-                kt = e.get("killer_team", 0)
                 first_tormentor = {**e, "is_radiant": kt == 2}
+            if kt == 2:
+                radiant_tormentors += 1
+            elif kt == 3:
+                dire_tormentors += 1
 
     return {
         "first_tower": first_tower,
@@ -1118,12 +1126,14 @@ def analyse_special_events(events: list[dict]) -> dict:
         "dire_towers": dire_towers,
         "radiant_roshans": radiant_roshans,
         "dire_roshans": dire_roshans,
+        "radiant_tormentors": radiant_tormentors,
+        "dire_tormentors": dire_tormentors,
     }
 
 
 # ── Full match pipeline ────────────────────────────────────────────────────────
 
-def process_match(match_id: str, replay_url_override: str | None = None) -> dict:
+def process_match(match_id: str) -> dict:
     """
     Fetch match data, download & parse replay, compute kill milestones.
     Returns everything needed for rendering.
@@ -1228,6 +1238,8 @@ def process_match(match_id: str, replay_url_override: str | None = None) -> dict
     milestones["dire_towers"] = special["dire_towers"]
     milestones["radiant_roshans"] = special["radiant_roshans"]
     milestones["dire_roshans"] = special["dire_roshans"]
+    milestones["radiant_tormentors"] = special["radiant_tormentors"]
+    milestones["dire_tormentors"] = special["dire_tormentors"]
     milestones["first_tormentor"] = special["first_tormentor"]
     milestones["interval_kills"] = analyse_interval_kills(kills, radiant_score + dire_score)
     milestones["runes"] = analyse_runes(kills, duration)
@@ -1409,6 +1421,18 @@ def render_match_analysis(data: dict) -> None:
             f"Total Roshans: **{total_r}** "
             f"(<span style='color:{RADIANT_COLOR}'>{rad_r}</span>/"
             f"<span style='color:{DIRE_COLOR}'>{dir_r}</span>)",
+            unsafe_allow_html=True,
+        )
+
+    # Tormentor totals (replay only)
+    rad_tm = m.get("radiant_tormentors", 0)
+    dir_tm = m.get("dire_tormentors", 0)
+    total_tm = rad_tm + dir_tm
+    with tc3:
+        st.markdown(
+            f"Total Tormentors: **{total_tm}** "
+            f"(<span style='color:{RADIANT_COLOR}'>{rad_tm}</span>/"
+            f"<span style='color:{DIRE_COLOR}'>{dir_tm}</span>)",
             unsafe_allow_html=True,
         )
     st.markdown(f"Megacreeps: **{megas_label}**", unsafe_allow_html=True)
