@@ -132,15 +132,6 @@ def parse_match_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def parse_valve_replay_url(url: str) -> tuple[str, str] | None:
-    """Return (match_id, replay_url) when the input is a direct Valve replay URL."""
-    raw = url.strip()
-    m = re.search(r"https?://replay\d+\.valve\.net/570/(\d+)_\d+\.dem\.bz2", raw)
-    if not m:
-        return None
-    return m.group(1), raw
-
-
 _SECRET_QUERY_PARAM_RE = re.compile(
     r"(?i)([?&])(api_key|key|access_token|token|password)=[^&#\s]+"
 )
@@ -570,7 +561,47 @@ def fetch_series_matches(match: dict) -> tuple[list[dict], bool]:
         except Exception:
             methods_failed += 1
 
-    # 3. Fallback Method 2: SQL Explorer (Head-to-Head within +/- 24 hours)
+    # 3. Valve Steam Web API GetMatchHistory filtered by league — real-time,
+    # unlike OpenDota's aggregate tables (proMatches / league matches / SQL
+    # explorer), which can lag behind by days for fresh matches. Entries
+    # include series_id, so grouping is exact when the anchor has one;
+    # otherwise fall back to head-to-head teams within ±8 h.
+    steam_api_key = get_setting("STEAM_API_KEY")
+    if steam_api_key and league_id:
+        methods_attempted += 1
+        try:
+            resp = requests.get(
+                f"{STEAM_API_BASE}/IDOTA2Match_570/GetMatchHistory/v1",
+                params={
+                    "key": steam_api_key,
+                    "league_id": league_id,
+                    "matches_requested": 100,
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                entries = (resp.json().get("result") or {}).get("matches") or []
+                for m in entries:
+                    if series_id:
+                        same_series = m.get("series_id") == series_id
+                    else:
+                        same_series = (
+                            radiant_team_id
+                            and dire_team_id
+                            and {m.get("radiant_team_id"), m.get("dire_team_id")}
+                            == {radiant_team_id, dire_team_id}
+                            and abs(m.get("start_time", 0) - start_time) <= 28800
+                        )
+                    if same_series:
+                        # OpenDota entries win — they may carry replay_url /
+                        # cluster / replay_salt used for the replay hint.
+                        found_matches.setdefault(str(m["match_id"]), m)
+            else:
+                methods_failed += 1
+        except Exception:
+            methods_failed += 1
+
+    # 4. Fallback Method: SQL Explorer (Head-to-Head within +/- 24 hours)
     # This catches matches where series_id hasn't been assigned yet.
     # Only run when series_id is NOT set — if series_id is known, Methods 1 & 2
     # already handle grouping correctly, and the broad time window would otherwise
@@ -607,14 +638,22 @@ def fetch_series_matches(match: dict) -> tuple[list[dict], bool]:
     # When all matches are still found through one method, no degradation is signalled.
     degraded = methods_attempted > 0 and methods_failed == methods_attempted
 
-    # Ensure the anchor match is always in the list
+    # Ensure the anchor match is always in the list — and always use its full
+    # /matches payload, which carries cluster/replay_salt for the replay hint
+    # (list-endpoint and GetMatchHistory entries don't).
     match_id_str = str(match["match_id"])
-    if match_id_str not in found_matches:
-        found_matches[match_id_str] = match
+    found_matches[match_id_str] = match
 
     # Sort and format the results
     series = list(found_matches.values())
     series.sort(key=lambda m: m.get("start_time", 0))
+
+    # When the anchor says it's part of a multi-map series (series_type 1=Bo3,
+    # 2=Bo5) but no sibling matches could be discovered, the map number is
+    # unknown — don't mislabel it "Map 1".
+    map_number_unknown = (
+        len(series) == 1 and bool(series_id) and bool(match.get("series_type"))
+    )
 
     result = []
     for i, m in enumerate(series, start=1):
@@ -633,7 +672,8 @@ def fetch_series_matches(match: dict) -> tuple[list[dict], bool]:
             )
         )
 
-        label = f"Map {i} ✓" if replay_hint else f"Map {i} ⏳"
+        map_name = "Map ?" if map_number_unknown else f"Map {i}"
+        label = f"{map_name} ✓" if replay_hint else f"{map_name} ⏳"
         btn_type = "primary" if replay_hint else "secondary"
 
         result.append({
@@ -1198,16 +1238,11 @@ def process_match(match_id: str) -> dict:
             "dire_megas": api_dire_megas,
         }
 
-    if replay_url_override:
-        replay_url = replay_url_override
-        replay_source = "Manual Valve replay URL"
-        replay_err = None
-    else:
-        replay_url, replay_source, replay_err = resolve_replay_url(
-            match_id,
-            match,
-            queue_opendota_parse=True,
-        )
+    replay_url, replay_source, replay_err = resolve_replay_url(
+        match_id,
+        match,
+        queue_opendota_parse=True,
+    )
     if not replay_url:
         return _basic_info(replay_err=replay_err)
 
@@ -1382,7 +1417,7 @@ def render_match_analysis(data: dict) -> None:
     rad_t = data.get("radiant_towers", 0) if not replay_available else m.get("radiant_towers", 0)
     dir_t = data.get("dire_towers", 0)    if not replay_available else m.get("dire_towers", 0)
     total_t = rad_t + dir_t
-    tc1, tc2 = st.columns(2)
+    tc1, tc2, tc3 = st.columns(3)
     with tc1:
         st.markdown(
             f"Total Towers: **{total_t}** "
@@ -2646,11 +2681,6 @@ if st.session_state.series_matches is not None:
     maps = st.session_state.series_matches
     if maps:
         st.markdown("**Select a map to analyze:**")
-        manual_replay_url = st.text_input(
-            "Optional direct Valve replay URL",
-            placeholder="http://replay273.valve.net/570/8822412074_<replay_salt>.dem.bz2",
-            help="Use this when Dotabuff has the replay but OpenDota has not published replay_salt yet. Paste the direct Valve replay link, then click that map.",
-        ).strip()
         btn_cols = st.columns(len(maps))
         for i, m in enumerate(maps):
             with btn_cols[i]:
@@ -2659,19 +2689,7 @@ if st.session_state.series_matches is not None:
                 if st.button(m["label"], type="primary" if is_primary else "secondary", key=f"map_btn_{m['match_id']}"):
                     try:
                         st.session_state.replay_retry_count = 0
-                        replay_override = None
-                        if manual_replay_url:
-                            parsed_replay = parse_valve_replay_url(manual_replay_url)
-                            if not parsed_replay:
-                                st.error("The direct replay URL must look like http://replay273.valve.net/570/8822412074_<replay_salt>.dem.bz2")
-                                st.stop()
-                            replay_match_id, replay_override = parsed_replay
-                            if replay_match_id != str(m["match_id"]):
-                                st.error(
-                                    f"That replay URL is for match {replay_match_id}, but you clicked match {m['match_id']}."
-                                )
-                                st.stop()
-                        data = process_match(m["match_id"], replay_url_override=replay_override)
+                        data = process_match(m["match_id"])
                         st.session_state.match_analysis = data
                         st.rerun()
                     except FileNotFoundError as exc:
