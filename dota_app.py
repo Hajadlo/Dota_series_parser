@@ -120,6 +120,12 @@ def towers_from_status(tower_status: int) -> int:
     return 11 - bin(tower_status).count("1")
 
 
+def barracks_from_status(barracks_status: int) -> int:
+    """Return the number of barracks destroyed from a 6-bit bitmask.
+    Each bit = 1 means that barracks is still standing, so destroyed = 6 - popcount."""
+    return 6 - bin(barracks_status).count("1")
+
+
 def parse_match_id(url: str) -> str | None:
     """Extract a Dota 2 match ID from a URL or accept a raw numeric match ID."""
     raw = url.strip()
@@ -1104,12 +1110,14 @@ def analyse_special_events(events: list[dict]) -> dict:
                      via entity inventory change on CDOTA_Item_Aegis).
     Tower totals   — radiant_towers = towers destroyed BY Radiant (Dire towers that fell).
                      dire_towers    = towers destroyed BY Dire   (Radiant towers that fell).
+    Barracks totals — radiant_barracks = barracks destroyed BY Radiant (Dire barracks that fell).
+                     dire_barracks    = barracks destroyed BY Dire   (Radiant barracks that fell).
     Roshan totals  — radiant_roshans / dire_roshans by killer_team.
     Tormentor totals — radiant_tormentors / dire_tormentors by killer_team.
 
     Returns dict with first_tower, first_barracks, first_aegis,
-    radiant_towers, dire_towers, radiant_roshans, dire_roshans,
-    radiant_tormentors, dire_tormentors.
+    radiant_towers, dire_towers, radiant_barracks, dire_barracks,
+    radiant_roshans, dire_roshans, radiant_tormentors, dire_tormentors.
     """
     first_tower: dict | None = None
     first_barracks: dict | None = None
@@ -1117,6 +1125,8 @@ def analyse_special_events(events: list[dict]) -> dict:
     first_tormentor: dict | None = None
     radiant_towers = 0
     dire_towers = 0
+    radiant_barracks = 0
+    dire_barracks = 0
     radiant_roshans = 0
     dire_roshans = 0
     radiant_tormentors = 0
@@ -1134,10 +1144,14 @@ def analyse_special_events(events: list[dict]) -> dict:
             elif got == 3:
                 dire_towers += 1
         elif etype == "barracks":
+            lost = e.get("lost_team", 0)
+            got = 3 if lost == 2 else (2 if lost == 3 else 0)
             if first_barracks is None:
-                lost = e.get("lost_team", 0)
-                got = 3 if lost == 2 else (2 if lost == 3 else 0)
                 first_barracks = {**e, "got_team": got, "is_radiant": got == 2}
+            if got == 2:
+                radiant_barracks += 1
+            elif got == 3:
+                dire_barracks += 1
         elif etype == "aegis":
             if first_aegis is None:
                 kt = e.get("killer_team", 0)
@@ -1164,6 +1178,8 @@ def analyse_special_events(events: list[dict]) -> dict:
         "first_tormentor": first_tormentor,
         "radiant_towers": radiant_towers,
         "dire_towers": dire_towers,
+        "radiant_barracks": radiant_barracks,
+        "dire_barracks": dire_barracks,
         "radiant_roshans": radiant_roshans,
         "dire_roshans": dire_roshans,
         "radiant_tormentors": radiant_tormentors,
@@ -1204,9 +1220,13 @@ def process_match(match_id: str) -> dict:
     api_radiant_towers = towers_from_status(ts_dire)
     api_dire_towers    = towers_from_status(ts_radiant)
 
-    # Megacreeps from barracks bitmask (6 bits; 0 = all barracks gone = opponent has megas)
+    # Barracks counts + megacreeps from barracks bitmask (6 bits; bit = 1 means
+    # still standing; 0 = all barracks gone = opponent has megas)
     bs_radiant = int(match.get("barracks_status_radiant", 63))
     bs_dire    = int(match.get("barracks_status_dire",    63))
+    # radiant_barracks = barracks destroyed BY Radiant (i.e. Dire barracks that fell)
+    api_radiant_barracks = barracks_from_status(bs_dire)
+    api_dire_barracks    = barracks_from_status(bs_radiant)
     # radiant_megas = True when Dire barracks all fell (Radiant earned megas)
     api_radiant_megas = bs_dire == 0
     api_dire_megas    = bs_radiant == 0
@@ -1234,6 +1254,8 @@ def process_match(match_id: str) -> dict:
             "duration": duration,
             "radiant_towers": api_radiant_towers,
             "dire_towers": api_dire_towers,
+            "radiant_barracks": api_radiant_barracks,
+            "dire_barracks": api_dire_barracks,
             "radiant_megas": api_radiant_megas,
             "dire_megas": api_dire_megas,
         }
@@ -1271,6 +1293,8 @@ def process_match(match_id: str) -> dict:
     milestones["first_aegis"] = special["first_aegis"]
     milestones["radiant_towers"] = special["radiant_towers"]
     milestones["dire_towers"] = special["dire_towers"]
+    milestones["radiant_barracks"] = special["radiant_barracks"]
+    milestones["dire_barracks"] = special["dire_barracks"]
     milestones["radiant_roshans"] = special["radiant_roshans"]
     milestones["dire_roshans"] = special["dire_roshans"]
     milestones["radiant_tormentors"] = special["radiant_tormentors"]
@@ -1417,12 +1441,24 @@ def render_match_analysis(data: dict) -> None:
     rad_t = data.get("radiant_towers", 0) if not replay_available else m.get("radiant_towers", 0)
     dir_t = data.get("dire_towers", 0)    if not replay_available else m.get("dire_towers", 0)
     total_t = rad_t + dir_t
-    tc1, tc2, tc3 = st.columns(3)
+    tc1, tc2, tc3, tc4 = st.columns(4)
     with tc1:
         st.markdown(
             f"Total Towers: **{total_t}** "
             f"(<span style='color:{RADIANT_COLOR}'>{rad_t}</span>/"
             f"<span style='color:{DIRE_COLOR}'>{dir_t}</span>)",
+            unsafe_allow_html=True,
+        )
+
+    # Barracks totals — available from API bitmask even without a replay
+    rad_b = data.get("radiant_barracks", 0) if not replay_available else m.get("radiant_barracks", 0)
+    dir_b = data.get("dire_barracks", 0)    if not replay_available else m.get("dire_barracks", 0)
+    total_b = rad_b + dir_b
+    with tc2:
+        st.markdown(
+            f"Total Barracks: **{total_b}** "
+            f"(<span style='color:{RADIANT_COLOR}'>{rad_b}</span>/"
+            f"<span style='color:{DIRE_COLOR}'>{dir_b}</span>)",
             unsafe_allow_html=True,
         )
 
@@ -1442,7 +1478,7 @@ def render_match_analysis(data: dict) -> None:
         megas_label = "None"
 
     if not replay_available:
-        with tc2:
+        with tc3:
             st.markdown(f"Megacreeps: **{megas_label}**", unsafe_allow_html=True)
         st.info(data.get("replay_error") or "Replay not available yet — kill milestone data will appear once the replay is ready. ⏳")
         return
@@ -1451,7 +1487,7 @@ def render_match_analysis(data: dict) -> None:
     rad_r = m.get("radiant_roshans", 0)
     dir_r = m.get("dire_roshans", 0)
     total_r = rad_r + dir_r
-    with tc2:
+    with tc3:
         st.markdown(
             f"Total Roshans: **{total_r}** "
             f"(<span style='color:{RADIANT_COLOR}'>{rad_r}</span>/"
@@ -1463,7 +1499,7 @@ def render_match_analysis(data: dict) -> None:
     rad_tm = m.get("radiant_tormentors", 0)
     dir_tm = m.get("dire_tormentors", 0)
     total_tm = rad_tm + dir_tm
-    with tc3:
+    with tc4:
         st.markdown(
             f"Total Tormentors: **{total_tm}** "
             f"(<span style='color:{RADIANT_COLOR}'>{rad_tm}</span>/"
