@@ -6,9 +6,11 @@ Trader-facing tool that parses Dota 2 pro-match replays and resolves book market
 ## Language
 
 **Power Rune**:
-One of the 7 buff runes — arcane, double_damage, haste, illusion, invisibility,
-regeneration, shield — that spawns every 2 minutes from 6:00 game clock at a
-single, randomly chosen river spot. Excludes bounty, water, and wisdom runes.
+A non-bounty, non-water, non-wisdom rune that spawns every 2 minutes from 6:00
+game clock at a single, randomly chosen river spot. Known book labels are arcane,
+double_damage, haste, illusion, invisibility, regeneration, shield; unknown
+future river-rune enum ids are surfaced as `rune_<id>` rather than silently
+dropped.
 _Avoid_: rune (unqualified), powerup rune
 
 **Rune Spawn Side**:

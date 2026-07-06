@@ -41,16 +41,25 @@ public class KillExtractor {
     // game state 5 fires (e.g. pre-horn first blood) — they get negative times.
     private final List<RawEvent> buffer = new ArrayList<>();
 
-    private static final Map<Integer, String> POWER_RUNE_TYPES = Map.of(
+    private static final Map<Integer, String> KNOWN_RUNE_TYPES = Map.of(
         0, "double_damage",
         1, "haste",
         2, "illusion",
         3, "invisibility",
         4, "regeneration",
+        5, "bounty",
         6, "arcane",
+        7, "water",
+        8, "wisdom",
         9, "shield"
     );
+    // Bounty, water, and current wisdom/XP runes are not river power-rune
+    // markets. Unknown future enum ids are still surfaced as rune_<id>.
+    private static final Set<Integer> EXCLUDED_RUNE_TYPES = Set.of(5, 7, 8);
 
+    // Prefer the replay entity's m_szLocation="top"/"bot" when present. The
+    // coordinates are only a fallback for older schemas or missing location
+    // strings, and keep current behavior for known map points.
     // Calibrated from replay 8878081113: raw CBodyComponent coordinates are
     // centered by subtracting 16384. Observed river rune entity positions were
     // exactly top=(-1640, 1112), bot=(1180, -1216), matching known map points.
@@ -195,28 +204,33 @@ public class KillExtractor {
         }
 
         Integer runeType = getIntegerProperty(e, "m_iRuneType");
-        String runeTypeName = runeType == null ? null : POWER_RUNE_TYPES.get(runeType);
+        if (runeType == null) {
+            return;
+        }
+        String runeTypeName = KNOWN_RUNE_TYPES.getOrDefault(runeType, "rune_" + runeType);
         Float rawX = getCoordinate(e, "CBodyComponent.m_cellX", "CBodyComponent.m_vecX");
         Float rawY = getCoordinate(e, "CBodyComponent.m_cellY", "CBodyComponent.m_vecY");
         Float runeTime = getFloatProperty(e, "m_flRuneTime");
+        String location = getStringProperty(e, "m_szLocation");
+        Float worldX = rawX == null ? null : rawX - MAP_ORIGIN_OFFSET;
+        Float worldY = rawY == null ? null : rawY - MAP_ORIGIN_OFFSET;
 
         if (RUNE_DEBUG) {
             System.err.printf(
-                "RUNE handle=%d type=%s raw=(%s,%s) world=(%s,%s) m_flRuneTime=%s currentGameTime=%.3f%n",
-                e.getHandle(), String.valueOf(runeType), String.valueOf(rawX), String.valueOf(rawY),
-                rawX == null ? "null" : String.format("%.1f", rawX - MAP_ORIGIN_OFFSET),
-                rawY == null ? "null" : String.format("%.1f", rawY - MAP_ORIGIN_OFFSET),
+                "RUNE handle=%d type=%s type_name=%s location=%s raw=(%s,%s) world=(%s,%s) m_flRuneTime=%s currentGameTime=%.3f%n",
+                e.getHandle(), String.valueOf(runeType), runeTypeName, String.valueOf(location),
+                String.valueOf(rawX), String.valueOf(rawY),
+                worldX == null ? "null" : String.format("%.1f", worldX),
+                worldY == null ? "null" : String.format("%.1f", worldY),
                 String.valueOf(runeTime), currentRawTime - gameStartTime
             );
         }
 
-        if (runeTypeName == null || rawX == null || rawY == null) {
+        if (EXCLUDED_RUNE_TYPES.contains(runeType)) {
             return;
         }
 
-        float worldX = rawX - MAP_ORIGIN_OFFSET;
-        float worldY = rawY - MAP_ORIGIN_OFFSET;
-        String side = classifyPowerRuneSide(worldX, worldY);
+        String side = classifyPowerRuneSide(location, worldX, worldY);
         if (side == null) {
             return;
         }
@@ -228,7 +242,16 @@ public class KillExtractor {
         ));
     }
 
-    private static String classifyPowerRuneSide(float worldX, float worldY) {
+    private static String classifyPowerRuneSide(String location, Float worldX, Float worldY) {
+        if (location != null) {
+            String normalized = location.trim().toLowerCase();
+            if (normalized.equals("top") || normalized.equals("bot")) {
+                return normalized;
+            }
+        }
+        if (worldX == null || worldY == null) {
+            return null;
+        }
         double topDistance = Math.hypot(worldX - TOP_RUNE_X, worldY - TOP_RUNE_Y);
         double botDistance = Math.hypot(worldX - BOT_RUNE_X, worldY - BOT_RUNE_Y);
         double nearestDistance = Math.min(topDistance, botDistance);
@@ -255,6 +278,18 @@ public class KillExtractor {
             Object value = e.getProperty(propertyName);
             if (value instanceof Number) {
                 return ((Number) value).floatValue();
+            }
+        } catch (Exception ex) {
+            // unavailable on this tick/entity
+        }
+        return null;
+    }
+
+    private static String getStringProperty(Entity e, String propertyName) {
+        try {
+            Object value = e.getProperty(propertyName);
+            if (value instanceof String) {
+                return (String) value;
             }
         } catch (Exception ex) {
             // unavailable on this tick/entity

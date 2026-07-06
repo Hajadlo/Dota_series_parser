@@ -68,8 +68,9 @@ AWAY_OVER_COLOR = "#ff9800"
 INTERVAL_SECONDS = 600
 MAX_INTERVALS = 9  # 0-10 .. 80-90
 
-# Power-rune markets are defined every 2 minutes from 6:00. Keep labels exactly
-# as the book strings.
+# Power-rune markets are defined every 2 minutes from 6:00. Keep known labels
+# exactly as the book strings. Unknown future river-rune enum ids are surfaced as
+# rune_<id> by the Java extractor and appended dynamically when observed.
 RUNE_SPAWN_SECONDS = 120
 RUNE_FIRST_SPAWN_SECONDS = 360
 RUNE_TYPES = [
@@ -81,7 +82,31 @@ RUNE_TYPES = [
     "regeneration",
     "shield",
 ]
+EXCLUDED_RUNE_TYPES = {"bounty", "water", "wisdom"}
 RUNE_SIDES = ["top", "bot"]
+
+
+def _normalize_rune_type(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_rune_type_label(value) -> bool:
+    rune_type = _normalize_rune_type(value)
+    return (
+        bool(rune_type)
+        and rune_type not in EXCLUDED_RUNE_TYPES
+        and (rune_type in RUNE_TYPES or re.fullmatch(r"rune_\d+", rune_type) is not None)
+    )
+
+
+def _rune_type_options(spawns: list[dict] | None = None, extra: list | None = None) -> list[str]:
+    """Known rune labels plus any observed future rune labels, preserving order."""
+    options = list(RUNE_TYPES)
+    for value in list(extra or []) + [s.get("rune_type") for s in (spawns or [])]:
+        rune_type = _normalize_rune_type(value)
+        if _is_rune_type_label(rune_type) and rune_type not in options:
+            options.append(rune_type)
+    return options
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -889,9 +914,9 @@ def analyse_runes(events: list[dict], duration: int = 0) -> dict:
         nearest = int(round(t / RUNE_SPAWN_SECONDS) * RUNE_SPAWN_SECONDS)
         nearest = max(RUNE_FIRST_SPAWN_SECONDS, nearest)
         drift = t - nearest
-        rune_type = str(e.get("rune_type", "")).strip().lower()
+        rune_type = _normalize_rune_type(e.get("rune_type", ""))
         side = str(e.get("side", "")).strip().lower()
-        if abs(drift) > 3 or rune_type not in RUNE_TYPES or side not in RUNE_SIDES:
+        if abs(drift) > 3 or not _is_rune_type_label(rune_type) or side not in RUNE_SIDES:
             ignored.append({**e, "nearest_minute": nearest // 60, "drift": drift})
             continue
 
@@ -1729,8 +1754,8 @@ def _parse_rune_time_from_params(params: dict) -> int | None:
 def _rune_hint_card_row(market_label: str, entry: dict, spawn: dict) -> tuple | None:
     hint = str(entry.get("hint", "")).strip().lower()
     if market_label == "Rune Type At Time":
-        actual = str(spawn.get("rune_type", "")).strip().lower()
-        options = [(x, x) for x in RUNE_TYPES]
+        actual = _normalize_rune_type(spawn.get("rune_type", ""))
+        options = [(x, x) for x in _rune_type_options([spawn], extra=[hint])]
     elif market_label == "Rune Spawn Side At Time":
         actual = str(spawn.get("side", "")).strip().lower()
         options = [(x, x) for x in RUNE_SIDES]
@@ -2185,6 +2210,7 @@ def render_rune_markets(data: dict) -> None:
     if not minutes:
         return
 
+    rune_type_options = _rune_type_options(spawns)
     type_rows = []
     side_rows = []
     for minute in minutes:
@@ -2194,7 +2220,7 @@ def render_rune_markets(data: dict) -> None:
         label = f"{minute}m"
         type_rows.append((
             label,
-            [(value, "win" if value == rune_type else "off") for value in RUNE_TYPES],
+            [(value, "win" if value == rune_type else "off") for value in rune_type_options],
         ))
         side_rows.append((
             label,
