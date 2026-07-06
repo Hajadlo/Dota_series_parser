@@ -68,6 +68,21 @@ AWAY_OVER_COLOR = "#ff9800"
 INTERVAL_SECONDS = 600
 MAX_INTERVALS = 9  # 0-10 .. 80-90
 
+# Power-rune markets are defined every 2 minutes from 6:00. Keep labels exactly
+# as the book strings.
+RUNE_SPAWN_SECONDS = 120
+RUNE_FIRST_SPAWN_SECONDS = 360
+RUNE_TYPES = [
+    "arcane",
+    "double_damage",
+    "haste",
+    "illusion",
+    "invisibility",
+    "regeneration",
+    "shield",
+]
+RUNE_SIDES = ["top", "bot"]
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -846,6 +861,75 @@ def analyse_interval_kills(kills: list[dict], total_expected_kills: int = 0) -> 
     }
 
 
+def analyse_runes(events: list[dict], duration: int = 0) -> dict:
+    """Bucket power-rune events to their nearest even-minute Spawn Time.
+
+    The Java extractor emits rune events at the entity-observation time, which can
+    drift slightly from the exact 6:00/8:00/... spawn clock. We accept only events
+    within ±3s of the nearest 2-minute boundary, clamp the first allowed Spawn Time
+    to 6:00, and keep anomaly metadata for UI warnings.
+
+    `duration` (authoritative match length, seconds) bounds the expected Spawn
+    Times for gap detection; when missing we fall back to the last observed rune
+    event (never non-rune events — clarity emits phantom deaths post-ancient).
+    """
+    by_minute: dict[int, list[dict]] = {}
+    ignored: list[dict] = []
+    max_rune_time = 0.0
+
+    for e in events or []:
+        if e.get("type") != "rune":
+            continue
+        try:
+            t = float(e.get("time_f", e.get("time", 0)) or 0)
+        except (TypeError, ValueError):
+            t = 0.0
+        max_rune_time = max(max_rune_time, t)
+
+        nearest = int(round(t / RUNE_SPAWN_SECONDS) * RUNE_SPAWN_SECONDS)
+        nearest = max(RUNE_FIRST_SPAWN_SECONDS, nearest)
+        drift = t - nearest
+        rune_type = str(e.get("rune_type", "")).strip().lower()
+        side = str(e.get("side", "")).strip().lower()
+        if abs(drift) > 3 or rune_type not in RUNE_TYPES or side not in RUNE_SIDES:
+            ignored.append({**e, "nearest_minute": nearest // 60, "drift": drift})
+            continue
+
+        minute = nearest // 60
+        by_minute.setdefault(minute, []).append({
+            "minute": minute,
+            "rune_type": rune_type,
+            "side": side,
+            "time_f": t,
+            "drift": drift,
+        })
+
+    spawns: list[dict] = []
+    duplicates: list[dict] = []
+    for minute in sorted(by_minute):
+        bucket = sorted(by_minute[minute], key=lambda r: abs(float(r.get("drift", 0))))
+        spawns.append(bucket[0])
+        if len(bucket) > 1:
+            duplicates.append({"minute": minute, "spawns": bucket})
+
+    unknown_gaps: list[int] = []
+    # Expected Spawn Times run through the authoritative duration when we have
+    # it; a spawn landing within the final 3s of the game is not expected.
+    horizon = float(duration) if duration and duration > 0 else max_rune_time
+    if horizon >= RUNE_FIRST_SPAWN_SECONDS:
+        last_expected = int(max(horizon - 3, 0) // RUNE_SPAWN_SECONDS) * RUNE_SPAWN_SECONDS
+        for sec in range(RUNE_FIRST_SPAWN_SECONDS, last_expected + 1, RUNE_SPAWN_SECONDS):
+            minute = sec // 60
+            if minute not in by_minute:
+                unknown_gaps.append(minute)
+
+    return {
+        "spawns": spawns,
+        "duplicates": duplicates,
+        "unknown_gaps": unknown_gaps,
+        "ignored": ignored,
+    }
+
 def analyse_special_events(events: list[dict]) -> dict:
     """
     Scan sorted events for first tower death, first barracks death, first Aegis pickup,
@@ -1016,6 +1100,7 @@ def process_match(match_id: str, replay_url_override: str | None = None) -> dict
     milestones["dire_roshans"] = special["dire_roshans"]
     milestones["first_tormentor"] = special["first_tormentor"]
     milestones["interval_kills"] = analyse_interval_kills(kills, radiant_score + dire_score)
+    milestones["runes"] = analyse_runes(kills, duration)
 
     return {
         "match_id": match_id,
@@ -1220,6 +1305,9 @@ def render_match_analysis(data: dict) -> None:
 
     # ── Interval markets ───────────────────────────────────────────────────────
     render_interval_markets(data)
+
+    # ── Rune markets ───────────────────────────────────────────────────────────
+    render_rune_markets(data)
 
     # ── Debug: raw kill events ─────────────────────────────────────────────────
     raw_kills = data.get("raw_kills", [])
@@ -1512,6 +1600,10 @@ _INTERVAL_HINT_MARKETS = {
     "map interval total kills parity": "Parity",
     "map interval kills winner": "Winner",
 }
+_RUNE_HINT_MARKETS = {
+    "map rune type at time": "Rune Type At Time",
+    "map rune spawn side at time": "Rune Spawn Side At Time",
+}
 _HINT_MARKET_ORDER = ["Total Kills", "Kills Handicap", "Team Total Kills", "Parity", "Winner"]
 _HINT_CARD_TITLES = {
     "Total Kills": "Total Kills",
@@ -1519,6 +1611,11 @@ _HINT_CARD_TITLES = {
     "Team Total Kills": "Team Total Kills",
     "Parity": "Total Kills Parity",
     "Winner": "Kills Winner (3-way)",
+}
+_RUNE_HINT_MARKET_ORDER = ["Rune Type At Time", "Rune Spawn Side At Time"]
+_RUNE_HINT_CARD_TITLES = {
+    "Rune Type At Time": "Rune Type At Time",
+    "Rune Spawn Side At Time": "Rune Spawn Side At Time",
 }
 
 
@@ -1587,6 +1684,75 @@ def _parse_interval_param(value) -> int | None:
         return None
     return start // 10
 
+
+def _parse_rune_time_param(value) -> int | None:
+    """Parse a Dotabuff rune time param into a Spawn Time minute (6, 8, ...)."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    m = re.fullmatch(r"0*(\d{1,3})m", raw)
+    if m:
+        minute = int(m.group(1))
+    else:
+        m = re.fullmatch(r"0*(\d{1,3}):([0-5]\d)", raw)
+        if m:
+            minute = int(m.group(1)) if int(m.group(2)) == 0 else -1
+        elif re.fullmatch(r"\d+", raw):
+            n = int(raw)
+            minute = n // 60 if n >= 100 else n
+        else:
+            return None
+    if minute < 6 or minute % 2 != 0:
+        return None
+    return minute
+
+
+_RUNE_TIME_PARAM_KEYS = ("time", "spawntime", "spawn_time", "runetime", "rune_time", "minute")
+
+
+def _parse_rune_time_from_params(params: dict) -> int | None:
+    """Prefer explicit time-like keys; never read mapOrder (an even mapOrder ≥ 6
+    would otherwise parse as a Spawn Time and resolve against the wrong row)."""
+    items = sorted(
+        (params or {}).items(),
+        key=lambda kv: 0 if str(kv[0]).strip().lower() in _RUNE_TIME_PARAM_KEYS else 1,
+    )
+    for key, value in items:
+        if str(key).strip().lower() == "maporder":
+            continue
+        minute = _parse_rune_time_param(value)
+        if minute is not None:
+            return minute
+    return None
+
+
+def _rune_hint_card_row(market_label: str, entry: dict, spawn: dict) -> tuple | None:
+    hint = str(entry.get("hint", "")).strip().lower()
+    if market_label == "Rune Type At Time":
+        actual = str(spawn.get("rune_type", "")).strip().lower()
+        options = [(x, x) for x in RUNE_TYPES]
+    elif market_label == "Rune Spawn Side At Time":
+        actual = str(spawn.get("side", "")).strip().lower()
+        options = [(x, x) for x in RUNE_SIDES]
+    else:
+        return None
+    if hint not in [key for key, _ in options] or actual not in [key for key, _ in options]:
+        return None
+
+    cells = []
+    for key, text in options:
+        if key == hint == actual:
+            state = "hint_ok"
+        elif key == hint:
+            state = "hint_wrong"
+        elif key == actual:
+            state = "expected"
+        else:
+            state = "off"
+        cells.append((text, state))
+    verdict = "correct" if hint == actual else "wrong"
+    minute = int(spawn.get("minute", 0))
+    return ((minute, 0), f"{minute}m", cells, verdict)
 
 def _hint_card_row(
     market_label: str,
@@ -1690,18 +1856,15 @@ def _render_hint_checker(
     duration: int,
     home_name: str,
     away_name: str,
+    rune_data: dict | None = None,
 ) -> None:
-    """Paste-box that cross-checks Dotabuff interval-market hints against the
-    replay-derived interval kills, rendered as a second set of interval market
-    cards showing only the pasted (active) markets. Only interval markets are
-    verified; every other market in the paste is ignored, and hints for
-    intervals the game never reached are skipped entirely."""
+    """Paste-box that cross-checks Dotabuff interval and rune-market hints."""
     st.markdown("### Verify Dotabuff hints")
     raw = st.text_area(
-        "Paste the hint export here (only Map Interval markets are checked; everything else is ignored)",
+        "Paste the hint export here (Map Interval and Map Rune markets are checked; everything else is ignored)",
         key=f"hint_paste_{match_id}",
         height=170,
-        placeholder='[\n  {\n    "marketName": "Map Interval Kills Handicap",\n    "hint": "HOME",\n    "params": { "mapOrder": 1, "handicap": -12.5, "interval": "0-10" }\n  },\n  ...\n]',
+        placeholder='[\n  {\n    "marketName": "Map Interval Kills Handicap",\n    "hint": "HOME",\n    "params": { "mapOrder": 1, "handicap": -12.5, "interval": "0-10" }\n  },\n  {\n    "marketName": "Map Rune Type At Time",\n    "hint": "HASTE",\n    "params": { "mapOrder": 1, "time": "10m" }\n  }\n]',
     )
     if not raw.strip():
         return
@@ -1716,23 +1879,32 @@ def _render_hint_checker(
         )
 
     interval_entries = []
+    rune_entries = []
     ignored = 0
     for e in entries:
         key = re.sub(r"\s+", " ", str(e.get("marketName", "")).strip().lower())
-        label = _INTERVAL_HINT_MARKETS.get(key)
-        if label is None:
-            ignored += 1
+        interval_label = _INTERVAL_HINT_MARKETS.get(key)
+        rune_label = _RUNE_HINT_MARKETS.get(key)
+        if interval_label is not None:
+            interval_entries.append((interval_label, e))
+        elif rune_label is not None:
+            rune_entries.append((rune_label, e))
         else:
-            interval_entries.append((label, e))
+            ignored += 1
 
-    if not interval_entries:
-        st.warning(f"No interval-market hints found in the paste ({ignored} other hint(s) ignored).")
+    if not interval_entries and not rune_entries:
+        st.warning(f"No interval/rune-market hints found in the paste ({ignored} other hint(s) ignored).")
         return
 
+    # Interval hints must drive the map-order choice exactly as before rune
+    # support existed (a rune-only mapOrder must never change which map's
+    # interval hints get verified); rune entries only decide when there are
+    # no interval entries at all.
+    map_order_source = interval_entries if interval_entries else rune_entries
     map_orders = sorted(
         {
             (e.get("params") or {}).get("mapOrder")
-            for _, e in interval_entries
+            for _, e in map_order_source
             if isinstance((e.get("params") or {}).get("mapOrder"), int)
         }
     )
@@ -1744,13 +1916,18 @@ def _render_hint_checker(
             key=f"hint_map_order_{match_id}",
         )
 
-    # Group verifiable hints per interval → per market. Not-reached intervals
-    # are skipped entirely; unreadable hints and pushes are only counted.
     per_interval: dict[int, dict[str, list]] = {}
+    per_rune_market: dict[str, list] = {}
+    rune_by_minute = {
+        int(spawn.get("minute")): spawn
+        for spawn in (rune_data or {}).get("spawns", [])
+        if spawn.get("minute") is not None
+    }
     counts = {"wrong": 0, "correct": 0, "push": 0}
     not_reached = 0
     unreadable = 0
     seen: set[tuple] = set()
+
     for label, e in interval_entries:
         params = e.get("params") or {}
         if map_order is not None and params.get("mapOrder") not in (None, map_order):
@@ -1771,17 +1948,46 @@ def _render_hint_checker(
             unreadable += 1
             continue
         sort_key, row_label, cells, verdict = row
-        dedupe_key = (idx, label, row_label, str(e.get("hint", "")).strip().upper())
+        dedupe_key = ("interval", idx, label, row_label, str(e.get("hint", "")).strip().upper())
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
         counts[verdict] += 1
         per_interval.setdefault(idx, {}).setdefault(label, []).append((sort_key, row_label, cells))
 
-    if not per_interval:
+    for label, e in rune_entries:
+        params = e.get("params") or {}
+        if map_order is not None and params.get("mapOrder") not in (None, map_order):
+            continue
+        minute = _parse_rune_time_from_params(params)
+        if minute is None:
+            unreadable += 1
+            continue
+        spawn = rune_by_minute.get(minute)
+        if not spawn:
+            # A Spawn Time past the end of the game is a not-reached market,
+            # not an unreadable hint (mirrors the interval `idx > last_idx` path).
+            if duration > 0 and minute * 60 > duration:
+                not_reached += 1
+            else:
+                unreadable += 1
+            continue
+        row = _rune_hint_card_row(label, e, spawn)
+        if row is None:
+            unreadable += 1
+            continue
+        sort_key, row_label, cells, verdict = row
+        dedupe_key = ("rune", minute, label, row_label, str(e.get("hint", "")).strip().lower())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        counts[verdict] += 1
+        per_rune_market.setdefault(label, []).append((sort_key, row_label, cells))
+
+    if not per_interval and not per_rune_market:
         st.warning(
-            "No verifiable interval-market hints for this map "
-            f"({not_reached} not reached · {unreadable} unreadable · {ignored} non-interval ignored)."
+            "No verifiable interval/rune-market hints for this map "
+            f"({not_reached} not reached · {unreadable} unreadable · {ignored} other ignored)."
         )
         return
 
@@ -1794,7 +2000,7 @@ def _render_hint_checker(
     if unreadable:
         skipped_bits.append(f"{unreadable} unreadable")
     if ignored:
-        skipped_bits.append(f"{ignored} non-interval ignored")
+        skipped_bits.append(f"{ignored} other ignored")
     if skipped_bits:
         summary += " · " + " · ".join(skipped_bits)
     if counts["wrong"]:
@@ -1848,6 +2054,18 @@ def _render_hint_checker(
                     ))
                 st.markdown("".join(html), unsafe_allow_html=True)
 
+    if per_rune_market:
+        cols = st.columns([2, 1], gap="medium")
+        for col, market_label in zip(cols, _RUNE_HINT_MARKET_ORDER):
+            market_rows = per_rune_market.get(market_label)
+            if not market_rows:
+                continue
+            market_rows.sort(key=lambda r: r[0])
+            with col:
+                st.markdown(_im_card(
+                    _RUNE_HINT_CARD_TITLES[market_label],
+                    [(row_label, cells) for _, row_label, cells in market_rows],
+                ), unsafe_allow_html=True)
 
 def render_interval_markets(data: dict) -> None:
     """Render the Interval Markets section (5 markets per 10-minute interval).
@@ -1942,7 +2160,74 @@ def render_interval_markets(data: dict) -> None:
         duration,
         home_name,
         away_name,
+        (data.get("milestones") or {}).get("runes"),
     )
+
+
+def render_rune_markets(data: dict) -> None:
+    """Render power-rune markets by Spawn Time, independent of Home/Away."""
+    m = data.get("milestones") or {}
+    rune_data = m.get("runes")
+    if not rune_data:
+        return
+
+    spawns = rune_data.get("spawns") or []
+    gaps = rune_data.get("unknown_gaps") or []
+    if not spawns and not gaps:
+        return
+
+    by_minute = {
+        int(spawn.get("minute")): spawn
+        for spawn in spawns
+        if spawn.get("minute") is not None
+    }
+    minutes = sorted(set(by_minute) | {int(minute) for minute in gaps})
+    if not minutes:
+        return
+
+    type_rows = []
+    side_rows = []
+    for minute in minutes:
+        spawn = by_minute.get(minute) or {}
+        rune_type = str(spawn.get("rune_type", "")).strip().lower()
+        side = str(spawn.get("side", "")).strip().lower()
+        label = f"{minute}m"
+        type_rows.append((
+            label,
+            [(value, "win" if value == rune_type else "off") for value in RUNE_TYPES],
+        ))
+        side_rows.append((
+            label,
+            [(value, "win" if value == side else "off") for value in RUNE_SIDES],
+        ))
+
+    st.divider()
+    st.markdown("## Rune Markets")
+    st.caption(
+        "Power rune spawns every 2 minutes from 6:00 — one randomly chosen river spot. "
+        "green = what spawned"
+    )
+
+    warnings = []
+    if gaps:
+        warnings.append("missing observed spawn for " + ", ".join(f"{int(minute)}m" for minute in gaps))
+    duplicates = rune_data.get("duplicates") or []
+    if duplicates:
+        warnings.append(
+            "duplicate rune events at "
+            + ", ".join(f"{int(item.get('minute', 0))}m" for item in duplicates)
+        )
+    ignored = rune_data.get("ignored") or []
+    if ignored:
+        warnings.append(f"{len(ignored)} rune event(s) ignored due to bad label or >3s drift")
+    if warnings:
+        st.caption("Rune anomaly warning: " + " · ".join(warnings))
+
+    c1, c2 = st.columns([2, 1], gap="medium")
+    with c1:
+        st.markdown(_im_card("Rune Type At Time", type_rows), unsafe_allow_html=True)
+    with c2:
+        st.markdown(_im_card("Rune Spawn Side At Time", side_rows), unsafe_allow_html=True)
 
 
 # ── Session state defaults ─────────────────────────────────────────────────────

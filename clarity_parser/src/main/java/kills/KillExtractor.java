@@ -4,6 +4,7 @@ import skadistats.clarity.model.CombatLogEntry;
 import skadistats.clarity.model.Entity;
 import skadistats.clarity.model.FieldPath;
 import skadistats.clarity.processor.entities.Entities;
+import skadistats.clarity.processor.entities.OnEntityCreated;
 import skadistats.clarity.processor.entities.OnEntityUpdated;
 import skadistats.clarity.processor.entities.UsesEntities;
 import skadistats.clarity.processor.gameevents.OnCombatLogEntry;
@@ -16,7 +17,10 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 @UsesEntities
 public class KillExtractor {
@@ -36,6 +40,29 @@ public class KillExtractor {
     // timestamps and flush everything. This handles kills that happen before
     // game state 5 fires (e.g. pre-horn first blood) — they get negative times.
     private final List<RawEvent> buffer = new ArrayList<>();
+
+    private static final Map<Integer, String> POWER_RUNE_TYPES = Map.of(
+        0, "double_damage",
+        1, "haste",
+        2, "illusion",
+        3, "invisibility",
+        4, "regeneration",
+        6, "arcane",
+        9, "shield"
+    );
+
+    // Calibrated from replay 8878081113: raw CBodyComponent coordinates are
+    // centered by subtracting 16384. Observed river rune entity positions were
+    // exactly top=(-1640, 1112), bot=(1180, -1216), matching known map points.
+    private static final float MAP_ORIGIN_OFFSET = 16384.0f;
+    private static final float TOP_RUNE_X = -1640.0f;
+    private static final float TOP_RUNE_Y = 1112.0f;
+    private static final float BOT_RUNE_X = 1180.0f;
+    private static final float BOT_RUNE_Y = -1216.0f;
+    private static final double MAX_POWER_RUNE_SPOT_DISTANCE = 600.0;
+    private static final boolean RUNE_DEBUG = "1".equals(System.getenv("RUNE_DEBUG"));
+
+    private final Set<Integer> emittedRuneHandles = new HashSet<>();
 
     public KillExtractor() {
         this.out = new PrintWriter(new OutputStreamWriter(System.out, StandardCharsets.UTF_8), true);
@@ -155,6 +182,95 @@ public class KillExtractor {
         ));
     }
 
+    // ── Entity listeners: rune spawns + Aegis pickup from hero inventory ─────
+
+    @OnEntityCreated(classPattern = "CDOTA_Item_Rune")
+    public void onRuneCreated(Entity e) {
+        maybeEmitRune(e);
+    }
+
+    private void maybeEmitRune(Entity e) {
+        if (!"CDOTA_Item_Rune".equals(e.getDtClass().getDtName()) || emittedRuneHandles.contains(e.getHandle())) {
+            return;
+        }
+
+        Integer runeType = getIntegerProperty(e, "m_iRuneType");
+        String runeTypeName = runeType == null ? null : POWER_RUNE_TYPES.get(runeType);
+        Float rawX = getCoordinate(e, "CBodyComponent.m_cellX", "CBodyComponent.m_vecX");
+        Float rawY = getCoordinate(e, "CBodyComponent.m_cellY", "CBodyComponent.m_vecY");
+        Float runeTime = getFloatProperty(e, "m_flRuneTime");
+
+        if (RUNE_DEBUG) {
+            System.err.printf(
+                "RUNE handle=%d type=%s raw=(%s,%s) world=(%s,%s) m_flRuneTime=%s currentGameTime=%.3f%n",
+                e.getHandle(), String.valueOf(runeType), String.valueOf(rawX), String.valueOf(rawY),
+                rawX == null ? "null" : String.format("%.1f", rawX - MAP_ORIGIN_OFFSET),
+                rawY == null ? "null" : String.format("%.1f", rawY - MAP_ORIGIN_OFFSET),
+                String.valueOf(runeTime), currentRawTime - gameStartTime
+            );
+        }
+
+        if (runeTypeName == null || rawX == null || rawY == null) {
+            return;
+        }
+
+        float worldX = rawX - MAP_ORIGIN_OFFSET;
+        float worldY = rawY - MAP_ORIGIN_OFFSET;
+        String side = classifyPowerRuneSide(worldX, worldY);
+        if (side == null) {
+            return;
+        }
+
+        emittedRuneHandles.add(e.getHandle());
+        bufferEvent(currentRawTime, String.format(
+            "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":\"%s\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
+            runeTypeName, side
+        ));
+    }
+
+    private static String classifyPowerRuneSide(float worldX, float worldY) {
+        double topDistance = Math.hypot(worldX - TOP_RUNE_X, worldY - TOP_RUNE_Y);
+        double botDistance = Math.hypot(worldX - BOT_RUNE_X, worldY - BOT_RUNE_Y);
+        double nearestDistance = Math.min(topDistance, botDistance);
+        if (nearestDistance > MAX_POWER_RUNE_SPOT_DISTANCE) {
+            return null;
+        }
+        return topDistance <= botDistance ? "top" : "bot";
+    }
+
+    private static Integer getIntegerProperty(Entity e, String propertyName) {
+        try {
+            Object value = e.getProperty(propertyName);
+            if (value instanceof Number) {
+                return ((Number) value).intValue();
+            }
+        } catch (Exception ex) {
+            // unavailable on this tick/entity
+        }
+        return null;
+    }
+
+    private static Float getFloatProperty(Entity e, String propertyName) {
+        try {
+            Object value = e.getProperty(propertyName);
+            if (value instanceof Number) {
+                return ((Number) value).floatValue();
+            }
+        } catch (Exception ex) {
+            // unavailable on this tick/entity
+        }
+        return null;
+    }
+
+    private static Float getCoordinate(Entity e, String cellProperty, String vecProperty) {
+        Integer cell = getIntegerProperty(e, cellProperty);
+        Float vec = getFloatProperty(e, vecProperty);
+        if (cell == null) {
+            return null;
+        }
+        return cell * 128.0f + (vec == null ? 0.0f : vec);
+    }
+
     // ── Entity listener: detect Aegis pickup from hero inventory ─────────────
     //
     // When Roshan dies the Aegis item entity (CDOTA_Item_Aegis) is placed into
@@ -165,6 +281,10 @@ public class KillExtractor {
     @OnEntityUpdated
     public void onEntityUpdated(Context ctx, Entity e, FieldPath[] updatedPaths, int updateCount) {
         String dtName = e.getDtClass().getDtName();
+        if ("CDOTA_Item_Rune".equals(dtName)) {
+            maybeEmitRune(e);
+            return;
+        }
         if (!dtName.startsWith("CDOTA_Unit_Hero")) return;
 
         for (int i = 0; i < updateCount; i++) {
