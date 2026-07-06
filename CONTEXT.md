@@ -29,7 +29,14 @@ The exact lowercase book string for a market selection (`double_damage`, `top`,
 tool and Dotabuff hint pastes.
 _Avoid_: prettified names (Double Damage, Bottom)
 
+**Map Networth Leader At Time**:
+Home/Away market resolving which team had higher total team net worth at fixed
+game-clock snapshots: 5:00, 10:00, and 15:00. Net worth is sampled from replay
+`CDOTA_DataRadiant` / `CDOTA_DataDire` team data. Ties are shown as no winning
+selection.
+_Avoid_: earned gold leader, gold spent leader
+
 **Home / Away**:
-Trader-assigned team perspective for interval kill markets (blue = Home & Under,
-orange = Away & Over). Rune markets do not use it.
+Trader-assigned team perspective for interval kill markets and networth-leader
+markets (blue = Home & Under, orange = Away & Over). Rune markets do not use it.
 _Avoid_: Radiant = Home default

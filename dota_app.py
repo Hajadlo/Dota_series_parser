@@ -85,6 +85,9 @@ RUNE_TYPES = [
 EXCLUDED_RUNE_TYPES = {"bounty", "water", "wisdom"}
 RUNE_SIDES = ["top", "bot"]
 
+# Map Networth Leader At Time markets settle at fixed game-clock snapshots.
+NETWORTH_LEADER_SECONDS = (300, 600, 900)
+
 
 def _normalize_rune_type(value) -> str:
     return str(value or "").strip().lower()
@@ -740,6 +743,38 @@ def run_kill_extractor(dem_path: str) -> list[dict]:
     return kills
 
 
+def run_gold_extractor(dem_path: str, target_seconds: tuple[int, ...] = NETWORTH_LEADER_SECONDS) -> list[dict]:
+    """Run GoldExtractor against the .dem file and return networth snapshots."""
+    if not os.path.isfile(JAR_PATH):
+        raise FileNotFoundError(
+            f"JAR not found at {JAR_PATH}.\n"
+            "Please build it in IntelliJ: Gradle panel → Tasks → build → jar"
+        )
+    java_exe = _find_java()
+    result = subprocess.run(
+        [java_exe, "-cp", JAR_PATH, "kills.GoldExtractor", dem_path, *[str(x) for x in target_seconds]],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"GoldExtractor failed:\n{result.stderr[:2000]}")
+
+    snapshots = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            snapshots.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+
+    snapshots.sort(key=lambda k: k.get("target_time", k.get("clock", 0)))
+    return snapshots
+
+
 # ── Kill milestone analysis ────────────────────────────────────────────────────
 
 def is_countable_hero_kill(event: dict) -> bool:
@@ -955,6 +990,69 @@ def analyse_runes(events: list[dict], duration: int = 0) -> dict:
         "ignored": ignored,
     }
 
+
+def analyse_networth_leaders(snapshots: list[dict], duration: int = 0) -> dict:
+    """Normalize GoldExtractor snapshots for Map Networth Leader At Time markets."""
+    by_minute: dict[int, list[dict]] = {}
+    ignored: list[dict] = []
+
+    for row in snapshots or []:
+        try:
+            target_time = int(round(float(row.get("target_time", 0) or 0)))
+            clock = float(row.get("clock", target_time) or target_time)
+            radiant_networth = int(row.get("radiant_networth", 0) or 0)
+            dire_networth = int(row.get("dire_networth", 0) or 0)
+        except (TypeError, ValueError):
+            ignored.append(row)
+            continue
+
+        if target_time not in NETWORTH_LEADER_SECONDS:
+            ignored.append(row)
+            continue
+
+        if radiant_networth > dire_networth:
+            leader_team = 2
+        elif dire_networth > radiant_networth:
+            leader_team = 3
+        else:
+            leader_team = 0
+
+        minute = target_time // 60
+        by_minute.setdefault(minute, []).append({
+            "minute": minute,
+            "target_time": target_time,
+            "time_f": clock,
+            "drift": clock - target_time,
+            "radiant_networth": radiant_networth,
+            "dire_networth": dire_networth,
+            "networth_diff": radiant_networth - dire_networth,
+            "leader_team": leader_team,
+        })
+
+    snapshots_out: list[dict] = []
+    duplicates: list[dict] = []
+    for minute in sorted(by_minute):
+        bucket = sorted(by_minute[minute], key=lambda r: abs(float(r.get("drift", 0))))
+        snapshots_out.append(bucket[0])
+        if len(bucket) > 1:
+            duplicates.append({"minute": minute, "snapshots": bucket})
+
+    unknown_gaps = []
+    for sec in NETWORTH_LEADER_SECONDS:
+        if duration and duration < sec:
+            continue
+        minute = sec // 60
+        if minute not in by_minute:
+            unknown_gaps.append(minute)
+
+    return {
+        "snapshots": snapshots_out,
+        "duplicates": duplicates,
+        "unknown_gaps": unknown_gaps,
+        "ignored": ignored,
+    }
+
+
 def analyse_special_events(events: list[dict]) -> dict:
     """
     Scan sorted events for first tower death, first barracks death, first Aegis pickup,
@@ -1103,7 +1201,9 @@ def process_match(match_id: str, replay_url_override: str | None = None) -> dict
     if not replay_url:
         return _basic_info(replay_err=replay_err)
 
-    # Download & decompress replay, parse kills
+    # Download & decompress replay, parse replay-derived markets
+    gold_snapshots = []
+    gold_error = None
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             dem_path = os.path.join(tmpdir, f"{match_id}.dem")
@@ -1111,6 +1211,11 @@ def process_match(match_id: str, replay_url_override: str | None = None) -> dict
                 download_and_decompress_replay(replay_url, dem_path)
             with st.spinner("Parsing replay for kill events..."):
                 kills = run_kill_extractor(dem_path)
+            try:
+                with st.spinner("Parsing replay for networth snapshots..."):
+                    gold_snapshots = run_gold_extractor(dem_path)
+            except Exception as exc:
+                gold_error = str(exc)
     except Exception as exc:
         return _basic_info(replay_err=str(exc), replay_source=replay_source)
 
@@ -1126,6 +1231,9 @@ def process_match(match_id: str, replay_url_override: str | None = None) -> dict
     milestones["first_tormentor"] = special["first_tormentor"]
     milestones["interval_kills"] = analyse_interval_kills(kills, radiant_score + dire_score)
     milestones["runes"] = analyse_runes(kills, duration)
+    milestones["networth_leaders"] = analyse_networth_leaders(gold_snapshots, duration)
+    if gold_error:
+        milestones["networth_leader_error"] = gold_error
 
     return {
         "match_id": match_id,
@@ -1145,6 +1253,47 @@ def process_match(match_id: str, replay_url_override: str | None = None) -> dict
 
 
 # ── Render ─────────────────────────────────────────────────────────────────────
+
+
+def _fmt_networth(value: int) -> str:
+    return f"{int(value):,}"
+
+
+def render_home_away_selector(data: dict) -> dict | None:
+    """Shared Home/Away selector for trader-perspective markets."""
+    rn = data["radiant_name"]
+    dn = data["dire_name"]
+
+    st.divider()
+    st.markdown("## Home/Away Markets")
+    st.caption("Networth and interval markets use the trader-assigned Home/Away perspective.")
+
+    radiant_label = f"{rn} (Radiant)"
+    dire_label = f"{dn} (Dire)"
+    choice = st.radio(
+        "Which team is **Home**?",
+        [radiant_label, dire_label],
+        index=None,
+        horizontal=True,
+        key=f"home_team_{data['match_id']}",
+    )
+    if choice is None:
+        st.info("Select the Home team above to reveal Home/Away market resolutions.")
+        return None
+
+    home_is_radiant = choice == radiant_label
+    home_name, away_name = (rn, dn) if home_is_radiant else (dn, rn)
+    st.markdown(
+        f"{_chip(f'Home = {home_name}', HOME_UNDER_COLOR)} · "
+        f"{_chip(f'Away = {away_name}', AWAY_OVER_COLOR)}",
+        unsafe_allow_html=True,
+    )
+    return {
+        "home_is_radiant": home_is_radiant,
+        "home_name": home_name,
+        "away_name": away_name,
+    }
+
 
 def render_match_analysis(data: dict) -> None:
     rn = data["radiant_name"]
@@ -1328,8 +1477,11 @@ def render_match_analysis(data: dict) -> None:
             unsafe_allow_html=True,
         )
 
-    # ── Interval markets ───────────────────────────────────────────────────────
-    render_interval_markets(data)
+    # ── Home/Away markets ─────────────────────────────────────────────────────
+    home_context = render_home_away_selector(data)
+    if home_context is not None:
+        render_networth_leader_markets(data, home_context)
+        render_interval_markets(data, home_context)
 
     # ── Rune markets ───────────────────────────────────────────────────────────
     render_rune_markets(data)
@@ -2092,7 +2244,139 @@ def _render_hint_checker(
                     [(row_label, cells) for _, row_label, cells in market_rows],
                 ), unsafe_allow_html=True)
 
-def render_interval_markets(data: dict) -> None:
+def render_networth_leader_markets(data: dict, home_context: dict) -> None:
+    """Render Map Networth Leader At Time using Home/Away labels."""
+    m = data.get("milestones") or {}
+    networth_data = m.get("networth_leaders") or {}
+    snapshots = networth_data.get("snapshots") or []
+    gaps = networth_data.get("unknown_gaps") or []
+    if not snapshots and not gaps and not m.get("networth_leader_error"):
+        return
+
+    home_is_radiant = bool(home_context.get("home_is_radiant"))
+    home_team = 2 if home_is_radiant else 3
+    away_team = 3 if home_is_radiant else 2
+    home_name = home_context["home_name"]
+    away_name = home_context["away_name"]
+
+    by_minute = {
+        int(row.get("minute")): row
+        for row in snapshots
+        if row.get("minute") is not None
+    }
+    minutes = sorted(set(by_minute) | {int(minute) for minute in gaps})
+
+    rows = []
+    for minute in minutes:
+        row = by_minute.get(minute)
+        if row is None:
+            comparison = (
+                "<div style='display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);"
+                "gap:8px;align-items:center;'>"
+                f"<div style='background:{_IM_CELL_BG};border-left:3px solid {HOME_UNDER_COLOR};"
+                f"border-radius:6px;padding:7px 9px;color:{_IM_TEXT};'>"
+                f"<div style='font-size:0.68rem;color:{_IM_DIM};text-transform:uppercase;'>Home</div>"
+                f"<div style='font-weight:650;'>{home_name}</div>"
+                f"<div style='font-size:0.72rem;color:{_IM_DIM};'>unknown</div></div>"
+                f"<div style='background:{_IM_LABEL_BG};color:{_IM_DIM};border:1px solid {_IM_BORDER};"
+                "border-radius:999px;padding:5px 10px;text-align:center;white-space:nowrap;font-weight:700;'>"
+                "unknown<br><span style='font-size:0.62rem;font-weight:500;'>diff</span></div>"
+                f"<div style='background:{_IM_CELL_BG};border-left:3px solid {AWAY_OVER_COLOR};"
+                f"border-radius:6px;padding:7px 9px;color:{_IM_TEXT};'>"
+                f"<div style='font-size:0.68rem;color:{_IM_DIM};text-transform:uppercase;'>Away</div>"
+                f"<div style='font-weight:650;'>{away_name}</div>"
+                f"<div style='font-size:0.72rem;color:{_IM_DIM};'>unknown</div></div>"
+                "</div>"
+            )
+            rows.append((f"{minute}m", comparison))
+            continue
+
+        radiant_nw = int(row.get("radiant_networth", 0) or 0)
+        dire_nw = int(row.get("dire_networth", 0) or 0)
+        leader_team = int(row.get("leader_team", 0) or 0)
+        home_nw = radiant_nw if home_is_radiant else dire_nw
+        away_nw = dire_nw if home_is_radiant else radiant_nw
+        diff = home_nw - away_nw
+        if diff > 0:
+            diff_value = f"+{_fmt_networth(diff)}"
+            diff_label = "Home lead"
+        elif diff < 0:
+            diff_value = f"+{_fmt_networth(abs(diff))}"
+            diff_label = "Away lead"
+        else:
+            diff_value = "0"
+            diff_label = "Tie"
+
+        home_bg = _IM_WIN_BG if leader_team == home_team else _IM_CELL_BG
+        away_bg = _IM_WIN_BG if leader_team == away_team else _IM_CELL_BG
+        diff_bg = _IM_WIN_BG if leader_team in (home_team, away_team) else _IM_LABEL_BG
+        comparison = (
+            "<div style='display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);"
+            "gap:8px;align-items:center;'>"
+            f"<div style='background:{home_bg};border-left:3px solid {HOME_UNDER_COLOR};"
+            f"border-radius:6px;padding:7px 9px;color:{_IM_TEXT};min-width:0;'>"
+            f"<div style='font-size:0.68rem;color:{_IM_DIM};text-transform:uppercase;'>Home</div>"
+            f"<div style='font-weight:650;overflow-wrap:break-word;'>{home_name}</div>"
+            f"<div style='font-size:0.8rem;font-weight:700;'>{_fmt_networth(home_nw)}</div></div>"
+            f"<div style='background:{diff_bg};color:#eaf5ee;border:1px solid {_IM_BORDER};"
+            "border-radius:999px;padding:6px 12px;text-align:center;white-space:nowrap;"
+            "box-shadow:0 0 0 2px rgba(0,0,0,0.18);'>"
+            f"<div style='font-size:0.88rem;font-weight:800;line-height:1.05;'>{diff_value}</div>"
+            f"<div style='font-size:0.62rem;font-weight:600;color:{_IM_DIM};text-transform:uppercase;'>{diff_label}</div></div>"
+            f"<div style='background:{away_bg};border-left:3px solid {AWAY_OVER_COLOR};"
+            f"border-radius:6px;padding:7px 9px;color:{_IM_TEXT};min-width:0;'>"
+            f"<div style='font-size:0.68rem;color:{_IM_DIM};text-transform:uppercase;'>Away</div>"
+            f"<div style='font-weight:650;overflow-wrap:break-word;'>{away_name}</div>"
+            f"<div style='font-size:0.8rem;font-weight:700;'>{_fmt_networth(away_nw)}</div></div>"
+            "</div>"
+        )
+        rows.append((f"{minute}m", comparison))
+
+    st.markdown("### Map Networth Leader At Time")
+    st.caption("Team net worth snapshots at 5:00, 10:00, and 15:00 game clock — green = leader.")
+    if rows:
+        parts = [
+            f"<div style='background:{_IM_CARD_BG};border:1px solid {_IM_BORDER};"
+            f"border-radius:6px;overflow:hidden;margin-bottom:10px;'>"
+            f"<div style='background:{_IM_HEADER_BG};padding:5px 10px;color:{_IM_TEXT};"
+            f"font-weight:600;font-size:0.8rem;'>Map Networth Leader At Time</div>"
+            f"<table style='width:100%;border-collapse:collapse;font-size:0.78rem;'>"
+        ]
+        for label, comparison in rows:
+            parts.append("<tr>")
+            parts.append(
+                f"<td style='background:{_IM_LABEL_BG};color:{_IM_TEXT};padding:6px 8px;"
+                f"width:14%;border-bottom:2px solid {_IM_CARD_BG};white-space:nowrap;"
+                f"font-weight:700;vertical-align:middle;'>{label}</td>"
+            )
+            parts.append(
+                f"<td style='background:{_IM_CELL_BG};padding:6px 8px;"
+                f"border-bottom:2px solid {_IM_CARD_BG};border-left:2px solid {_IM_CARD_BG};'>"
+                f"{comparison}</td>"
+            )
+            parts.append("</tr>")
+        parts.append("</table></div>")
+        st.markdown("".join(parts), unsafe_allow_html=True)
+
+    warnings = []
+    if gaps:
+        warnings.append("missing networth snapshot for " + ", ".join(f"{int(minute)}m" for minute in gaps))
+    duplicates = networth_data.get("duplicates") or []
+    if duplicates:
+        warnings.append(
+            "duplicate networth snapshots at "
+            + ", ".join(f"{int(item.get('minute', 0))}m" for item in duplicates)
+        )
+    ignored = networth_data.get("ignored") or []
+    if ignored:
+        warnings.append(f"{len(ignored)} networth snapshot(s) ignored")
+    if m.get("networth_leader_error"):
+        warnings.append("GoldExtractor failed: " + str(m.get("networth_leader_error"))[:300])
+    if warnings:
+        st.caption("Networth warning: " + " · ".join(warnings))
+
+
+def render_interval_markets(data: dict, home_context: dict | None = None) -> None:
     """Render the Interval Markets section (5 markets per 10-minute interval).
 
     The user must pick which team is Home before any resolution is shown —
@@ -2103,36 +2387,20 @@ def render_interval_markets(data: dict) -> None:
     if not interval_data:
         return
 
-    rn = data["radiant_name"]
-    dn = data["dire_name"]
+    if home_context is None:
+        home_context = render_home_away_selector(data)
+    if home_context is None:
+        return
+    home_is_radiant = bool(home_context.get("home_is_radiant"))
+    home_name = home_context["home_name"]
+    away_name = home_context["away_name"]
 
     st.divider()
     st.markdown("## Interval Markets")
     st.caption(
         "10-minute game-clock windows (0-10 = 0:00-9:59, 10-20 = 10:00-19:59, ...). "
-        "Pre-horn kills (negative clock) are excluded."
-    )
-
-    radiant_label = f"{rn} (Radiant)"
-    dire_label = f"{dn} (Dire)"
-    choice = st.radio(
-        "Which team is **Home**?",
-        [radiant_label, dire_label],
-        index=None,
-        horizontal=True,
-        key=f"home_team_{data['match_id']}",
-    )
-    if choice is None:
-        st.info("Select the Home team above to reveal interval market resolutions.")
-        return
-    home_is_radiant = choice == radiant_label
-
-    home_name, away_name = (rn, dn) if home_is_radiant else (dn, rn)
-    st.markdown(
-        f"{_chip(f'Home = {home_name}', HOME_UNDER_COLOR)} · "
-        f"{_chip(f'Away = {away_name}', AWAY_OVER_COLOR)} — "
-        "green cell = winning selection · handicap lines are from the Home perspective",
-        unsafe_allow_html=True,
+        "Pre-horn kills (negative clock) are excluded. Green cell = winning selection; "
+        "handicap lines are from the Home perspective."
     )
 
     pre_horn = interval_data.get("pre_horn_kills", 0)
