@@ -2519,20 +2519,6 @@ def render_interval_markets(data: dict, home_context: dict | None = None) -> Non
 
     st.divider()
     st.markdown("## Interval Markets")
-    st.caption(
-        "10-minute game-clock windows (0-10 = 0:00-9:59, 10-20 = 10:00-19:59, ...). "
-        "Pre-horn kills (negative clock) are excluded. Green cell = winning selection; "
-        "handicap lines are from the Home perspective."
-    )
-
-    pre_horn = interval_data.get("pre_horn_kills", 0)
-    if pre_horn:
-        st.caption(f"{pre_horn} pre-horn kill(s) excluded from all intervals.")
-    post_90 = interval_data.get("post_90_kills", 0)
-    if post_90:
-        st.warning(
-            f"{post_90} kill(s) at/after 90:00 ignored — interval markets are only defined up to 90."
-        )
 
     duration = int(data.get("duration", 0))
     if duration <= 0:
@@ -2541,31 +2527,49 @@ def render_interval_markets(data: dict, home_context: dict | None = None) -> Non
 
     max_span = MAX_INTERVALS * INTERVAL_SECONDS
     last_idx = min((max(duration - 1, 0)) // INTERVAL_SECONDS, MAX_INTERVALS - 1)
-
     intervals = interval_data["intervals"]
-    shown = list(range(last_idx + 1))
 
-    # Lay intervals out horizontally, up to 4 per row, so traders can scan
-    # across the game the same way the resolving tool lists markets.
-    PER_ROW = 4
-    for chunk_start in range(0, len(shown), PER_ROW):
-        chunk = shown[chunk_start:chunk_start + PER_ROW]
-        cols = st.columns(PER_ROW, gap="medium")
-        for col, idx in zip(cols, chunk):
-            bucket = intervals[idx]
-            home_k = bucket["radiant_kills"] if home_is_radiant else bucket["dire_kills"]
-            away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
+    # The parsed all-interval view is collapsed by default — day to day the
+    # hint checker below is the primary surface; open this to see every market.
+    with st.expander("Parsed interval markets (every interval, from the replay)", expanded=False):
+        st.caption(
+            "10-minute game-clock windows (0-10 = 0:00-9:59, 10-20 = 10:00-19:59, ...). "
+            "Pre-horn kills (negative clock) are excluded. Green cell = winning selection; "
+            "handicap lines are from the Home perspective."
+        )
 
-            header = f"Interval {idx * 10}-{(idx + 1) * 10}"
-            is_partial = (
-                idx == last_idx
-                and duration < (idx + 1) * INTERVAL_SECONDS
-                and duration < max_span
+        pre_horn = interval_data.get("pre_horn_kills", 0)
+        if pre_horn:
+            st.caption(f"{pre_horn} pre-horn kill(s) excluded from all intervals.")
+        post_90 = interval_data.get("post_90_kills", 0)
+        if post_90:
+            st.warning(
+                f"{post_90} kill(s) at/after 90:00 ignored — interval markets are only defined up to 90."
             )
-            sub = f"⚠️ partial interval — game ended {_fmt_clock(duration)}, resolved as-is" if is_partial else None
 
-            with col:
-                _render_interval_cards(header, sub, home_k, away_k, home_name, away_name)
+        shown = list(range(last_idx + 1))
+
+        # Lay intervals out horizontally, up to 4 per row, so traders can scan
+        # across the game the same way the resolving tool lists markets.
+        PER_ROW = 4
+        for chunk_start in range(0, len(shown), PER_ROW):
+            chunk = shown[chunk_start:chunk_start + PER_ROW]
+            cols = st.columns(PER_ROW, gap="medium")
+            for col, idx in zip(cols, chunk):
+                bucket = intervals[idx]
+                home_k = bucket["radiant_kills"] if home_is_radiant else bucket["dire_kills"]
+                away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
+
+                header = f"Interval {idx * 10}-{(idx + 1) * 10}"
+                is_partial = (
+                    idx == last_idx
+                    and duration < (idx + 1) * INTERVAL_SECONDS
+                    and duration < max_span
+                )
+                sub = f"⚠️ partial interval — game ended {_fmt_clock(duration)}, resolved as-is" if is_partial else None
+
+                with col:
+                    _render_interval_cards(header, sub, home_k, away_k, home_name, away_name)
 
     _render_hint_checker(
         data["match_id"],
@@ -2619,31 +2623,35 @@ def render_rune_markets(data: dict) -> None:
 
     st.divider()
     st.markdown("## Rune Markets")
-    st.caption(
-        "Power rune spawns every 2 minutes from 6:00 — one randomly chosen river spot. "
-        "green = what spawned"
-    )
 
-    warnings = []
-    if gaps:
-        warnings.append("missing observed spawn for " + ", ".join(f"{int(minute)}m" for minute in gaps))
-    duplicates = rune_data.get("duplicates") or []
-    if duplicates:
-        warnings.append(
-            "duplicate rune events at "
-            + ", ".join(f"{int(item.get('minute', 0))}m" for item in duplicates)
+    # Collapsed by default — the hint checker is the primary surface; open
+    # this to see every parsed spawn.
+    with st.expander("Parsed rune spawns (every spawn, from the replay)", expanded=False):
+        st.caption(
+            "Power rune spawns every 2 minutes from 6:00 — one randomly chosen river spot. "
+            "green = what spawned"
         )
-    ignored = rune_data.get("ignored") or []
-    if ignored:
-        warnings.append(f"{len(ignored)} rune event(s) ignored due to bad label or >3s drift")
-    if warnings:
-        st.caption("Rune anomaly warning: " + " · ".join(warnings))
 
-    c1, c2 = st.columns([2, 1], gap="medium")
-    with c1:
-        st.markdown(_im_card("Rune Type At Time", type_rows), unsafe_allow_html=True)
-    with c2:
-        st.markdown(_im_card("Rune Spawn Side At Time", side_rows), unsafe_allow_html=True)
+        warnings = []
+        if gaps:
+            warnings.append("missing observed spawn for " + ", ".join(f"{int(minute)}m" for minute in gaps))
+        duplicates = rune_data.get("duplicates") or []
+        if duplicates:
+            warnings.append(
+                "duplicate rune events at "
+                + ", ".join(f"{int(item.get('minute', 0))}m" for item in duplicates)
+            )
+        ignored = rune_data.get("ignored") or []
+        if ignored:
+            warnings.append(f"{len(ignored)} rune event(s) ignored due to bad label or >3s drift")
+        if warnings:
+            st.caption("Rune anomaly warning: " + " · ".join(warnings))
+
+        c1, c2 = st.columns([2, 1], gap="medium")
+        with c1:
+            st.markdown(_im_card("Rune Type At Time", type_rows), unsafe_allow_html=True)
+        with c2:
+            st.markdown(_im_card("Rune Spawn Side At Time", side_rows), unsafe_allow_html=True)
 
 
 # ── Session state defaults ─────────────────────────────────────────────────────
