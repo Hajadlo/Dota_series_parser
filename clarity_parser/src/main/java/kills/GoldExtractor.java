@@ -30,6 +30,12 @@ import java.util.Locale;
  * uses replay ticks instead of waiting for another combat-log event. This keeps
  * quiet games from drifting to the next fight before sampling net worth.
  *
+ * Pauses are excluded from the clock via CDOTAGamerulesProxy.m_nTotalPausedTicks
+ * so samples land at true in-game 5/10/15:00 (matching the HUD and OpenDota),
+ * not wall-clock ticks. Without this, a long early pause would shift every
+ * sample minutes earlier and can even flip the reported net worth leader. Net
+ * worth is never sampled while the game is paused.
+ *
  * Per-player gold comes from the CDOTA_DataRadiant / CDOTA_DataDire entities:
  *   m_vecDataTeam.%04d.m_iNetWorth
  *   m_vecDataTeam.%04d.m_iTotalEarnedGold
@@ -47,6 +53,9 @@ public class GoldExtractor {
 
     private boolean sawGameStart = false;
     private int gameStartTick = -1;
+    // Total paused ticks already accumulated when the horn blew (pre-game pauses
+    // during hero selection / strategy time must not shift the in-game clock).
+    private int hornPausedTicks = 0;
 
     @OnCombatLogEntry
     public void onCombatLogEntry(CombatLogEntry cle) {
@@ -65,6 +74,20 @@ public class GoldExtractor {
         return null;
     }
 
+    private int readIntOr(Entity e, String prop, int fallback) {
+        Integer v = readInt(e, prop);
+        return v != null ? v : fallback;
+    }
+
+    private boolean readBool(Entity e, String prop) {
+        try {
+            Object v = e.getProperty(prop);
+            return v instanceof Boolean && (Boolean) v;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
     private int[] teamTotals(Entity dataTeam) {
         // returns {netWorthSum, earnedGoldSum}
         int nw = 0, eg = 0;
@@ -81,14 +104,33 @@ public class GoldExtractor {
     public void onTickStart(Context ctx, boolean synthetic) {
         if (nextTargetIndex >= targetTimes.length) return;
         if (!sawGameStart) return;
-        if (gameStartTick < 0) {
-            gameStartTick = ctx.getTick();
-        }
-
-        float clock = (ctx.getTick() - gameStartTick) * ctx.getMillisPerTick() / 1000.0f;
-        if (clock + 0.001f < targetTimes[nextTargetIndex]) return;
 
         Entities entities = ctx.getProcessor(Entities.class);
+        Entity rules = entities.getByDtName("CDOTAGamerulesProxy");
+        if (rules == null) return;
+
+        // m_nTotalPausedTicks is reconciled by the engine only when a pause ENDS.
+        // While paused it stays stale, so the derived clock keeps advancing during a
+        // pause. We must never sample net worth mid-pause: the board is frozen and the
+        // reported clock would be wrong. Once the game resumes the counter snaps to the
+        // correct value and the clock reflects true (pause-excluded) game time.
+        int totalPausedTicks = readIntOr(rules, "m_pGameRules.m_nTotalPausedTicks", 0);
+        boolean paused = readBool(rules, "m_pGameRules.m_bGamePaused");
+
+        if (gameStartTick < 0) {
+            gameStartTick = ctx.getTick();
+            hornPausedTicks = totalPausedTicks;
+        }
+
+        if (paused) return;
+
+        // Pause-excluded game clock: elapsed ticks since the horn minus the ticks the
+        // game spent paused after the horn. This matches the in-game clock (and the
+        // OpenDota/Dotabuff timeline) even across long pauses.
+        int elapsedTicks = ctx.getTick() - gameStartTick - (totalPausedTicks - hornPausedTicks);
+        float clock = elapsedTicks * ctx.getMillisPerTick() / 1000.0f;
+        if (clock + 0.001f < targetTimes[nextTargetIndex]) return;
+
         Entity radiantData = entities.getByDtName("CDOTA_DataRadiant");
         Entity direData = entities.getByDtName("CDOTA_DataDire");
         if (radiantData == null || direData == null) return;
