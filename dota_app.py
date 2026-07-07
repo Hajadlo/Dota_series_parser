@@ -978,6 +978,9 @@ def analyse_runes(events: list[dict], duration: int = 0) -> dict:
     `duration` (authoritative match length, seconds) bounds the expected Spawn
     Times for gap detection; when missing we fall back to the last observed rune
     event (never non-rune events — clarity emits phantom deaths post-ancient).
+
+    Every observed spawn is kept — rune markets run for the whole game, with no
+    upper Spawn Time bound (spawns past 40:00 are still marketed).
     """
     by_minute: dict[int, list[dict]] = {}
     ignored: list[dict] = []
@@ -1999,32 +2002,37 @@ def _parse_rune_time_from_params(params: dict) -> int | None:
 
 
 def _rune_hint_card_row(market_label: str, entry: dict, spawn: dict) -> tuple | None:
-    hint = str(entry.get("hint", "")).strip().lower()
+    raw_hint = entry.get("hint")
+    hint = "" if raw_hint is None else str(raw_hint).strip().lower()
     if market_label == "Rune Type At Time":
         actual = _normalize_rune_type(spawn.get("rune_type", ""))
-        options = [(x, x) for x in _rune_type_options([spawn], extra=[hint])]
+        options = [(x, x) for x in _rune_type_options([spawn], extra=[hint] if hint else None)]
     elif market_label == "Rune Spawn Side At Time":
         actual = str(spawn.get("side", "")).strip().lower()
         options = [(x, x) for x in RUNE_SIDES]
     else:
         return None
-    if hint not in [key for key, _ in options] or actual not in [key for key, _ in options]:
+    keys = [key for key, _ in options]
+    if (hint and hint not in keys) or actual not in keys:
         return None
 
+    # With no hint (feed sends hint: null), only the parser's result is
+    # highlighted — yellow 'expected', same colour as "what actually won".
     cells = []
     for key, text in options:
-        if key == hint == actual:
+        if hint and key == hint == actual:
             state = "hint_ok"
-        elif key == hint:
+        elif hint and key == hint:
             state = "hint_wrong"
         elif key == actual:
             state = "expected"
         else:
             state = "off"
         cells.append((text, state))
-    verdict = "correct" if hint == actual else "wrong"
+    verdict = ("correct" if hint == actual else "wrong") if hint else "no_hint"
     minute = int(spawn.get("minute", 0))
-    return ((minute, 0), f"{minute}m", cells, verdict)
+    label = f"{minute}m" + ("" if hint else " · no hint")
+    return ((minute, 0), label, cells, verdict)
 
 def _hint_card_row(
     market_label: str,
@@ -2037,13 +2045,16 @@ def _hint_card_row(
     """Build one verification-card row for a pasted hint.
 
     Returns (sort_key, label, cells, verdict) or None when the hint is
-    unreadable. verdict ∈ 'correct' | 'wrong' | 'push'. Cells use
+    unreadable. verdict ∈ 'correct' | 'wrong' | 'push' | 'no_hint'. Cells use
     _IM_CELL_STYLES states: the hinted selection renders bland green when
     correct and bright red when wrong; when wrong, the selection that actually
-    won is highlighted yellow ('expected').
+    won is highlighted yellow ('expected'). Entries with hint: null (the feed
+    now sends hintless markets) get only the parser's result in yellow.
     """
     params = entry.get("params") or {}
-    hint = str(entry.get("hint", "")).strip().upper()
+    raw_hint = entry.get("hint")
+    hint = "" if raw_hint is None else str(raw_hint).strip().upper()
+    has_hint = bool(hint)
     total = home_k + away_k
     margin = home_k - away_k
 
@@ -2052,9 +2063,9 @@ def _hint_card_row(
         for key, text in options:
             if actual is None:  # push — no winning selection
                 state = "off"
-            elif key == hint == actual:
+            elif has_hint and key == hint == actual:
                 state = "hint_ok"
-            elif key == hint:
+            elif has_hint and key == hint:
                 state = "hint_wrong"
             elif key == actual:
                 state = "expected"
@@ -2064,19 +2075,25 @@ def _hint_card_row(
         return out
 
     def _verdict(actual: str | None) -> str:
+        if not has_hint:
+            return "no_hint"
         if actual is None:
             return "push"
         return "correct" if actual == hint else "wrong"
+
+    def _label(base: str, actual: str | None) -> str:
+        if not has_hint:
+            return base + " · no hint" + (" · push" if actual is None else "")
+        return base + (" · push" if actual is None else "")
 
     ou_options = [("UNDER", "under"), ("OVER", "over")]
 
     if market_label == "Total Kills":
         t = params.get("threshold")
-        if not isinstance(t, (int, float)) or hint not in ("OVER", "UNDER"):
+        if not isinstance(t, (int, float)) or (has_hint and hint not in ("OVER", "UNDER")):
             return None
         actual = None if total == t else ("OVER" if total > t else "UNDER")
-        label = f"{t:g}" + (" · push" if actual is None else "")
-        return ((0, t), label, _cells(ou_options, actual), _verdict(actual))
+        return ((0, t), _label(f"{t:g}", actual), _cells(ou_options, actual), _verdict(actual))
 
     if market_label == "Team Total Kills":
         t = params.get("threshold")
@@ -2084,38 +2101,43 @@ def _hint_card_row(
         if (
             not isinstance(t, (int, float))
             or side not in ("HOME", "AWAY")
-            or hint not in ("OVER", "UNDER")
+            or (has_hint and hint not in ("OVER", "UNDER"))
         ):
             return None
         kills = home_k if side == "HOME" else away_k
         actual = None if kills == t else ("OVER" if kills > t else "UNDER")
-        label = f"{t:g}, {side.lower()}" + (" · push" if actual is None else "")
+        label = _label(f"{t:g}, {side.lower()}", actual)
         return ((0 if side == "HOME" else 1, t), label, _cells(ou_options, actual), _verdict(actual))
 
     if market_label == "Kills Handicap":
         h = params.get("handicap")
-        if not isinstance(h, (int, float)) or hint not in ("HOME", "AWAY"):
+        if not isinstance(h, (int, float)) or (has_hint and hint not in ("HOME", "AWAY")):
             return None
-        adj = margin + h  # handicap applied to Home
+        # The hint export carries the NEGATED book line: a pasted handicap of
+        # -3.5 is the +3.5 Home line in the resolving tool. Flip the sign to
+        # recover the real line, then settle Home iff margin + line > 0
+        # (verified against match 8885183102 vs the resolving tool).
+        line = -h
+        adj = margin + line  # real line applied to Home
         actual = None if adj == 0 else ("HOME" if adj > 0 else "AWAY")
-        label = f"{h:+g}" + (" · push" if actual is None else "")
+        label = _label(f"{line:+g}", actual)
         options = [("HOME", home_name), ("AWAY", away_name)]
         # Descending line value = closest-to-even first, like the trading tool.
-        return ((0, -h), label, _cells(options, actual), _verdict(actual))
+        return ((0, -line), label, _cells(options, actual), _verdict(actual))
 
     if market_label == "Parity":
-        if hint not in ("ODD", "EVEN"):
+        if has_hint and hint not in ("ODD", "EVEN"):
             return None
         actual = "EVEN" if total % 2 == 0 else "ODD"
         options = [("ODD", "odd"), ("EVEN", "even")]
-        return ((0, 0), str(total), _cells(options, actual), _verdict(actual))
+        return ((0, 0), _label(str(total), actual), _cells(options, actual), _verdict(actual))
 
     if market_label == "Winner":
-        if hint not in ("HOME", "AWAY", "DRAW"):
+        if has_hint and hint not in ("HOME", "AWAY", "DRAW"):
             return None
         actual = "HOME" if margin > 0 else ("AWAY" if margin < 0 else "DRAW")
         options = [("HOME", home_name), ("DRAW", "draw"), ("AWAY", away_name)]
-        return ((0, 0), "3-way", _cells(options, actual), _verdict(actual))
+        return ((0, 0), _label("3-way", actual), _cells(options, actual), _verdict(actual))
 
     return None
 
@@ -2195,7 +2217,7 @@ def _render_hint_checker(
         for spawn in (rune_data or {}).get("spawns", [])
         if spawn.get("minute") is not None
     }
-    counts = {"wrong": 0, "correct": 0, "push": 0}
+    counts = {"wrong": 0, "correct": 0, "push": 0, "no_hint": 0}
     not_reached = 0
     unreadable = 0
     seen: set[tuple] = set()
@@ -2266,9 +2288,14 @@ def _render_hint_checker(
     summary = f"**{counts['wrong']} incorrect** · {counts['correct']} correct"
     if counts["push"]:
         summary += f" · {counts['push']} push"
+    if counts["no_hint"]:
+        summary += f" · {counts['no_hint']} without hint (parser result shown in yellow)"
     skipped_bits = []
     if not_reached:
-        skipped_bits.append(f"{not_reached} not-reached hint(s) skipped")
+        skipped_bits.append(
+            f"{not_reached} hint(s) skipped — market not reached "
+            f"(game ended {_fmt_clock(duration)})"
+        )
     if unreadable:
         skipped_bits.append(f"{unreadable} unreadable")
     if ignored:
@@ -2282,7 +2309,7 @@ def _render_hint_checker(
     st.markdown(
         f"{_chip('red = wrong hint', _HINT_WRONG_BG)} · "
         f"{_chip('green = correct hint', '#4f9d77')} · "
-        f"{_chip('yellow = what actually won', _HINT_EXPECTED_BG)}",
+        f"{_chip('yellow = what actually won / parser result for hintless markets', _HINT_EXPECTED_BG)}",
         unsafe_allow_html=True,
     )
 
@@ -2302,7 +2329,7 @@ def _render_hint_checker(
                 and duration < (idx + 1) * INTERVAL_SECONDS
                 and duration < MAX_INTERVALS * INTERVAL_SECONDS
             )
-            sub = f"partial — game ended {_fmt_clock(duration)}" if is_partial else None
+            sub = f"⚠️ partial interval — game ended {_fmt_clock(duration)}, resolved as-is" if is_partial else None
 
             with col:
                 st.markdown(f"#### {header}")
@@ -2535,7 +2562,7 @@ def render_interval_markets(data: dict, home_context: dict | None = None) -> Non
                 and duration < (idx + 1) * INTERVAL_SECONDS
                 and duration < max_span
             )
-            sub = f"partial — game ended {_fmt_clock(duration)}" if is_partial else None
+            sub = f"⚠️ partial interval — game ended {_fmt_clock(duration)}, resolved as-is" if is_partial else None
 
             with col:
                 _render_interval_cards(header, sub, home_k, away_k, home_name, away_name)
