@@ -1707,6 +1707,13 @@ def _fmt_clock(secs: float) -> str:
     return f"{sign}{s // 60}:{s % 60:02d}"
 
 
+def _completed_interval_count(duration: int | float) -> int:
+    """How many interval markets fully completed before the game ended."""
+    if duration <= 0:
+        return 0
+    return min(int(duration) // INTERVAL_SECONDS, MAX_INTERVALS)
+
+
 def _chip(text: str, color: str) -> str:
     return f"<span style='color:{color};font-weight:600'>{text}</span>"
 
@@ -2124,7 +2131,7 @@ def _render_hint_checker(
     match_id: str,
     intervals: list[dict],
     home_is_radiant: bool,
-    last_idx: int,
+    completed_interval_count: int,
     duration: int,
     home_name: str,
     away_name: str,
@@ -2196,7 +2203,7 @@ def _render_hint_checker(
         if spawn.get("minute") is not None
     }
     counts = {"wrong": 0, "correct": 0, "push": 0}
-    not_reached = 0
+    not_settled = 0
     unreadable = 0
     seen: set[tuple] = set()
 
@@ -2208,8 +2215,10 @@ def _render_hint_checker(
         if idx is None:
             unreadable += 1
             continue
-        if idx > last_idx:
-            not_reached += 1
+        # Only fully completed intervals settle. If the game ends during
+        # 40-50, that interval is canceled just like 50-60 and later.
+        if idx >= completed_interval_count:
+            not_settled += 1
             continue
 
         bucket = intervals[idx]
@@ -2238,9 +2247,9 @@ def _render_hint_checker(
         spawn = rune_by_minute.get(minute)
         if not spawn:
             # A Spawn Time past the end of the game is a not-reached market,
-            # not an unreadable hint (mirrors the interval `idx > last_idx` path).
+            # not an unreadable hint (mirrors the interval unsettled path).
             if duration > 0 and minute * 60 > duration:
-                not_reached += 1
+                not_settled += 1
             else:
                 unreadable += 1
             continue
@@ -2259,7 +2268,7 @@ def _render_hint_checker(
     if not per_interval and not per_rune_market:
         st.warning(
             "No verifiable interval/rune-market hints for this map "
-            f"({not_reached} not reached · {unreadable} unreadable · {ignored} other ignored)."
+            f"({not_settled} unsettled/canceled · {unreadable} unreadable · {ignored} other ignored)."
         )
         return
 
@@ -2267,8 +2276,8 @@ def _render_hint_checker(
     if counts["push"]:
         summary += f" · {counts['push']} push"
     skipped_bits = []
-    if not_reached:
-        skipped_bits.append(f"{not_reached} not-reached hint(s) skipped")
+    if not_settled:
+        skipped_bits.append(f"{not_settled} unsettled/canceled hint(s) skipped")
     if unreadable:
         skipped_bits.append(f"{unreadable} unreadable")
     if ignored:
@@ -2297,17 +2306,9 @@ def _render_hint_checker(
             away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
 
             header = f"Interval {idx * 10}-{(idx + 1) * 10}"
-            is_partial = (
-                idx == last_idx
-                and duration < (idx + 1) * INTERVAL_SECONDS
-                and duration < MAX_INTERVALS * INTERVAL_SECONDS
-            )
-            sub = f"partial — game ended {_fmt_clock(duration)}" if is_partial else None
 
             with col:
                 st.markdown(f"#### {header}")
-                if sub:
-                    st.caption(sub)
                 st.markdown(
                     f"{_chip(f'{home_name} {home_k}', HOME_UNDER_COLOR)} — "
                     f"{_chip(f'{away_name} {away_k}', AWAY_OVER_COLOR)} "
@@ -2472,7 +2473,7 @@ def render_networth_leader_markets(data: dict, home_context: dict) -> None:
 
 
 def render_interval_markets(data: dict, home_context: dict | None = None) -> None:
-    """Render the Interval Markets section (5 markets per 10-minute interval).
+    """Render settled Interval Markets (5 markets per completed 10-minute interval).
 
     The user must pick which team is Home before any resolution is shown —
     there is deliberately no Radiant=Home default.
@@ -2494,6 +2495,7 @@ def render_interval_markets(data: dict, home_context: dict | None = None) -> Non
     st.markdown("## Interval Markets")
     st.caption(
         "10-minute game-clock windows (0-10 = 0:00-9:59, 10-20 = 10:00-19:59, ...). "
+        "Only fully completed windows settle; an unfinished final interval is canceled/ignored. "
         "Pre-horn kills (negative clock) are excluded. Green cell = winning selection; "
         "handicap lines are from the Home perspective."
     )
@@ -2513,10 +2515,19 @@ def render_interval_markets(data: dict, home_context: dict | None = None) -> Non
         duration = int(interval_data.get("last_kill_time", 0)) + 1
 
     max_span = MAX_INTERVALS * INTERVAL_SECONDS
-    last_idx = min((max(duration - 1, 0)) // INTERVAL_SECONDS, MAX_INTERVALS - 1)
+    completed_interval_count = _completed_interval_count(duration)
+
+    if 0 < duration < max_span and duration % INTERVAL_SECONDS != 0:
+        canceled_start = completed_interval_count * 10
+        st.caption(
+            f"Game ended at {_fmt_clock(duration)}, so interval "
+            f"{canceled_start}-{canceled_start + 10} and later are canceled/ignored."
+        )
 
     intervals = interval_data["intervals"]
-    shown = list(range(last_idx + 1))
+    shown = list(range(completed_interval_count))
+    if not shown:
+        st.info("No interval markets completed before the game ended.")
 
     # Lay intervals out horizontally, up to 4 per row, so traders can scan
     # across the game the same way the resolving tool lists markets.
@@ -2530,21 +2541,15 @@ def render_interval_markets(data: dict, home_context: dict | None = None) -> Non
             away_k = bucket["dire_kills"] if home_is_radiant else bucket["radiant_kills"]
 
             header = f"Interval {idx * 10}-{(idx + 1) * 10}"
-            is_partial = (
-                idx == last_idx
-                and duration < (idx + 1) * INTERVAL_SECONDS
-                and duration < max_span
-            )
-            sub = f"partial — game ended {_fmt_clock(duration)}" if is_partial else None
 
             with col:
-                _render_interval_cards(header, sub, home_k, away_k, home_name, away_name)
+                _render_interval_cards(header, None, home_k, away_k, home_name, away_name)
 
     _render_hint_checker(
         data["match_id"],
         intervals,
         home_is_radiant,
-        last_idx,
+        completed_interval_count,
         duration,
         home_name,
         away_name,
