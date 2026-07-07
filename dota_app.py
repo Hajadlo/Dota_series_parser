@@ -1725,7 +1725,6 @@ _IM_TEXT = "#c9d4e0"
 _IM_DIM = "#93a4b5"
 
 # Hint-verification cell colours
-_HINT_WRONG_BG = "#ff1744"     # VERY bright red — wrong hints must scream
 _HINT_OK_BG = "#1e4636"        # bland green — correct hints, low visual priority
 _HINT_OK_TEXT = "#7fae97"
 _HINT_EXPECTED_BG = "#fdd835"  # yellow — the selection that actually won when the hint is wrong
@@ -1735,7 +1734,7 @@ _IM_CELL_STYLES = {
     "off":        (_IM_CELL_BG, _IM_DIM, "400"),
     "win":        (_IM_WIN_BG, "#eaf5ee", "600"),
     "hint_ok":    (_HINT_OK_BG, _HINT_OK_TEXT, "600"),
-    "hint_wrong": (_HINT_WRONG_BG, "#ffffff", "700"),
+    "hint_wrong": (_IM_CELL_BG, _IM_DIM, "400"),
     "expected":   (_HINT_EXPECTED_BG, "#1c2430", "700"),
 }
 
@@ -2047,7 +2046,7 @@ def _hint_card_row(
     Returns (sort_key, label, cells, verdict) or None when the hint is
     unreadable. verdict ∈ 'correct' | 'wrong' | 'push' | 'no_hint'. Cells use
     _IM_CELL_STYLES states: the hinted selection renders bland green when
-    correct and bright red when wrong; when wrong, the selection that actually
+    correct and default grey when wrong; when wrong, the selection that actually
     won is highlighted yellow ('expected'). Entries with hint: null (the feed
     now sends hintless markets) get only the parser's result in yellow.
     """
@@ -2307,7 +2306,7 @@ def _render_hint_checker(
     else:
         st.success(summary)
     st.markdown(
-        f"{_chip('red = wrong hint', _HINT_WRONG_BG)} · "
+        f"{_chip('grey = wrong JSON selection / inactive', _IM_DIM)} · "
         f"{_chip('green = correct hint', '#4f9d77')} · "
         f"{_chip('yellow = what actually won / parser result for hintless markets', _HINT_EXPECTED_BG)}",
         unsafe_allow_html=True,
