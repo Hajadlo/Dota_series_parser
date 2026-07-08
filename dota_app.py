@@ -1600,7 +1600,7 @@ def render_match_analysis(data: dict) -> None:
                 return {2: "Radiant", 3: "Dire"}.get(t, f"neutral({t})")
 
             def _mm_ss(secs: float) -> str:
-                s = int(secs)
+                s = int(float(secs) // 1)
                 sign = "-" if s < 0 else ""
                 s = abs(s)
                 return f"{sign}{s // 60}:{s % 60:02d}"
@@ -1704,7 +1704,7 @@ def render_match_analysis(data: dict) -> None:
 # ── Interval markets rendering ─────────────────────────────────────────────────
 
 def _fmt_clock(secs: float) -> str:
-    s = int(secs)
+    s = int(float(secs) // 1)
     sign = "-" if s < 0 else ""
     s = abs(s)
     return f"{sign}{s // 60}:{s % 60:02d}"
