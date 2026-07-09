@@ -1341,15 +1341,37 @@ def render_home_away_selector(data: dict) -> dict | None:
     st.divider()
     st.markdown("## Home/Away Markets")
     st.caption("Networth and interval markets use the trader-assigned Home/Away perspective.")
+    st.markdown(
+        """
+        <div style="
+            margin: 0.85rem 0 0.4rem 0;
+            padding: 0.85rem 1rem;
+            border-radius: 14px;
+            border: 2px solid #ffcc00;
+            background: linear-gradient(90deg, rgba(255, 204, 0, 0.22), rgba(255, 82, 82, 0.18));
+            color: #ffd54f;
+            font-size: 1.75rem;
+            font-weight: 900;
+            line-height: 1.15;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            text-shadow: 0 0 12px rgba(255, 204, 0, 0.45);
+        ">
+            Which team is Home IN RAIDEN?
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     radiant_label = f"{rn} (Radiant)"
     dire_label = f"{dn} (Dire)"
     choice = st.radio(
-        "Which team is **Home**?",
+        "Which team is Home IN RAIDEN?",
         [radiant_label, dire_label],
         index=None,
         horizontal=True,
         key=f"home_team_{data['match_id']}",
+        label_visibility="collapsed",
     )
     if choice is None:
         st.info("Select the Home team above to reveal Home/Away market resolutions.")
