@@ -2069,15 +2069,47 @@ def _hint_card_row(
     unreadable. verdict ∈ 'correct' | 'wrong' | 'push' | 'no_hint'. Cells use
     _IM_CELL_STYLES states: the hinted selection renders bland green when
     correct and default grey when wrong; when wrong, the selection that actually
-    won is highlighted yellow ('expected'). Entries with hint: null (the feed
-    now sends hintless markets) get only the parser's result in yellow.
+    won is highlighted yellow ('expected'). Entries with hint: null (or an
+    ambiguous all-selections hint like "ODD / EVEN") get only the parser's
+    result in yellow.
     """
     params = entry.get("params") or {}
     raw_hint = entry.get("hint")
-    hint = "" if raw_hint is None else str(raw_hint).strip().upper()
-    has_hint = bool(hint)
+    hint = ""
+    hint_note = "no hint"
+    has_hint = False
     total = home_k + away_k
     margin = home_k - away_k
+
+    def _market_hint(valid_options: tuple[str, ...]) -> tuple[str | None, str]:
+        """Normalize the pasted hint for this market.
+
+        Returns a single valid selection, "" when there is no usable hint (so
+        the parser's winning selection can still be shown), or None when the
+        value is unrelated/unreadable. Some malformed exports send every
+        selection, e.g. "ODD / EVEN"; treat that as ambiguous rather than
+        dropping the market.
+        """
+        if raw_hint is None:
+            return "", "no hint"
+        text = str(raw_hint).strip().upper()
+        if not text:
+            return "", "no hint"
+        if text in valid_options:
+            return text, "hint"
+
+        pieces = [
+            p.strip()
+            for p in re.split(r"\s*(?:/|\||,|;|\bOR\b)\s*", text)
+            if p.strip()
+        ]
+        if len(pieces) > 1 and all(p in valid_options for p in pieces):
+            distinct = list(dict.fromkeys(pieces))
+            if len(distinct) == 1:
+                return distinct[0], "hint"
+            return "", "ambiguous hint"
+
+        return None, "unreadable hint"
 
     def _cells(options: list[tuple[str, str]], actual: str | None) -> list[tuple[str, str]]:
         out = []
@@ -2104,14 +2136,16 @@ def _hint_card_row(
 
     def _label(base: str, actual: str | None) -> str:
         if not has_hint:
-            return base + " · no hint" + (" · push" if actual is None else "")
+            return base + f" · {hint_note}" + (" · push" if actual is None else "")
         return base + (" · push" if actual is None else "")
 
     ou_options = [("UNDER", "under"), ("OVER", "over")]
 
     if market_label == "Total Kills":
         t = params.get("threshold")
-        if not isinstance(t, (int, float)) or (has_hint and hint not in ("OVER", "UNDER")):
+        hint, hint_note = _market_hint(("OVER", "UNDER"))
+        has_hint = bool(hint)
+        if not isinstance(t, (int, float)) or hint is None:
             return None
         actual = None if total == t else ("OVER" if total > t else "UNDER")
         return ((0, t), _label(f"{t:g}", actual), _cells(ou_options, actual), _verdict(actual))
@@ -2119,10 +2153,12 @@ def _hint_card_row(
     if market_label == "Team Total Kills":
         t = params.get("threshold")
         side = str(params.get("side") or params.get("team") or "").strip().upper()
+        hint, hint_note = _market_hint(("OVER", "UNDER"))
+        has_hint = bool(hint)
         if (
             not isinstance(t, (int, float))
             or side not in ("HOME", "AWAY")
-            or (has_hint and hint not in ("OVER", "UNDER"))
+            or hint is None
         ):
             return None
         kills = home_k if side == "HOME" else away_k
@@ -2132,7 +2168,9 @@ def _hint_card_row(
 
     if market_label == "Kills Handicap":
         h = params.get("handicap")
-        if not isinstance(h, (int, float)) or (has_hint and hint not in ("HOME", "AWAY")):
+        hint, hint_note = _market_hint(("HOME", "AWAY"))
+        has_hint = bool(hint)
+        if not isinstance(h, (int, float)) or hint is None:
             return None
         # The hint export carries the NEGATED book line: a pasted handicap of
         # -3.5 is the +3.5 Home line in the resolving tool. Flip the sign to
@@ -2147,14 +2185,18 @@ def _hint_card_row(
         return ((0, -line), label, _cells(options, actual), _verdict(actual))
 
     if market_label == "Parity":
-        if has_hint and hint not in ("ODD", "EVEN"):
+        hint, hint_note = _market_hint(("ODD", "EVEN"))
+        has_hint = bool(hint)
+        if hint is None:
             return None
         actual = "EVEN" if total % 2 == 0 else "ODD"
         options = [("ODD", "odd"), ("EVEN", "even")]
         return ((0, 0), _label(str(total), actual), _cells(options, actual), _verdict(actual))
 
     if market_label == "Winner":
-        if has_hint and hint not in ("HOME", "AWAY", "DRAW"):
+        hint, hint_note = _market_hint(("HOME", "AWAY", "DRAW"))
+        has_hint = bool(hint)
+        if hint is None:
             return None
         actual = "HOME" if margin > 0 else ("AWAY" if margin < 0 else "DRAW")
         options = [("HOME", home_name), ("DRAW", "draw"), ("AWAY", away_name)]
@@ -2310,7 +2352,7 @@ def _render_hint_checker(
     if counts["push"]:
         summary += f" · {counts['push']} push"
     if counts["no_hint"]:
-        summary += f" · {counts['no_hint']} without hint (parser result shown in yellow)"
+        summary += f" · {counts['no_hint']} without usable hint (parser result shown in yellow)"
     skipped_bits = []
     if not_reached:
         skipped_bits.append(
