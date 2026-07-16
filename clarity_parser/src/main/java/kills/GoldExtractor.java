@@ -5,7 +5,7 @@ import skadistats.clarity.model.Entity;
 import skadistats.clarity.processor.entities.Entities;
 import skadistats.clarity.processor.entities.UsesEntities;
 import skadistats.clarity.processor.gameevents.OnCombatLogEntry;
-import skadistats.clarity.processor.reader.OnTickStart;
+import skadistats.clarity.processor.reader.OnTickEnd;
 import skadistats.clarity.processor.runner.Context;
 import skadistats.clarity.processor.runner.SimpleRunner;
 import skadistats.clarity.source.MappedFileSource;
@@ -100,7 +100,10 @@ public class GoldExtractor {
         return new int[]{nw, eg};
     }
 
-    @OnTickStart
+    // Sample after all messages for the tick have updated the entity state. Sampling
+    // at tick start reads the previous tick and can disagree with Dotabuff when net
+    // worth changes exactly on a target timestamp.
+    @OnTickEnd
     public void onTickStart(Context ctx, boolean synthetic) {
         if (nextTargetIndex >= targetTimes.length) return;
         if (!sawGameStart) return;
