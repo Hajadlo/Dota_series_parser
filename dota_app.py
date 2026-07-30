@@ -1,4 +1,3 @@
-import bz2
 import glob
 import json
 import os
@@ -16,6 +15,8 @@ from gevent.event import AsyncResult
 from steam.client import SteamClient
 from steam.enums import EResult
 from steam.enums.emsg import EMsg
+
+from replay_archive import decompress_replay_chunks
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Dota 2 Series Analyzer", layout="wide")
@@ -704,14 +705,10 @@ def request_opendota_parse(match_id: str) -> None:
 # ── Replay parsing ─────────────────────────────────────────────────────────────
 
 def download_and_decompress_replay(replay_url: str, dest_path: str) -> None:
-    """Download .dem.bz2, decompress to dest_path (.dem)."""
+    """Download a bzip2 or Zstandard replay archive into a .dem file."""
     resp = requests.get(replay_url, stream=True, timeout=120)
     resp.raise_for_status()
-    decompressor = bz2.BZ2Decompressor()
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192 * 4):
-            if chunk:
-                f.write(decompressor.decompress(chunk))
+    decompress_replay_chunks(resp.iter_content(chunk_size=8192 * 4), dest_path)
 
 
 def _find_java() -> str:
