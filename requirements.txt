@@ -1,4 +1,6 @@
 streamlit>=1.32.0
+# Streamlit 1.60.0 is incompatible with Starlette 1.4.0's GZipResponder API.
+starlette<1.4.0
 numpy>=2.3.0
 requests>=2.31.0
 zstandard>=0.23.0
