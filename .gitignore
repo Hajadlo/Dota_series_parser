@@ -7,4 +7,6 @@ __pycache__/
 .env
 sentry/
 .vscode/
-.gitnexus
+
+# Node
+node_modules/

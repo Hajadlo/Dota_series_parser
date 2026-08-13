@@ -1,0 +1,12 @@
+{
+  "name": "dota-series-parser-tools",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "gc:match": "node scripts/gc_match_details.js"
+  },
+  "dependencies": {
+    "protobufjs": "^7.5.4",
+    "steam-user": "^5.2.1"
+  }
+}

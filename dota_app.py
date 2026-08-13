@@ -27,7 +27,13 @@ OPENDOTA_BASE = os.environ.get(
     "https://api.opendota.com/api",
 )
 STEAM_API_BASE = "https://api.steampowered.com"
-VALVE_REPLAY_URL = "http://replay{cluster}.valve.net/570/{match_id}_{replay_salt}.dem.bz2"
+# Chinese (Perfect World) clusters CNAME replay{cluster}.valve.net to a CDN
+# that rejects the valve.net hostname; those replays are only reachable via
+# the dota2.com.cn mirror, so every cluster/salt lookup tries both hosts.
+VALVE_REPLAY_URL_TEMPLATES = (
+    "http://replay{cluster}.valve.net/570/{match_id}_{replay_salt}.dem.bz2",
+    "http://replay{cluster}.dota2.com.cn/570/{match_id}_{replay_salt}.dem.bz2",
+)
 
 # Path to the fat JAR — relative to this file
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -245,18 +251,21 @@ def has_valve_fallback_credentials() -> bool:
     )
 
 
-def build_valve_replay_url(
+def build_valve_replay_urls(
     match_id: str,
     cluster: int | str | None,
     replay_salt: int | str | None,
-) -> str | None:
+) -> list[str]:
     if cluster in (None, "", 0, "0") or replay_salt in (None, "", 0, "0"):
-        return None
-    return VALVE_REPLAY_URL.format(
-        cluster=cluster,
-        match_id=match_id,
-        replay_salt=replay_salt,
-    )
+        return []
+    return [
+        template.format(
+            cluster=cluster,
+            match_id=match_id,
+            replay_salt=replay_salt,
+        )
+        for template in VALVE_REPLAY_URL_TEMPLATES
+    ]
 
 
 def gc_match_to_dict(match) -> dict:
@@ -286,11 +295,56 @@ def gc_match_to_dict(match) -> dict:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def fetch_node_gc_match_details(match_id: str) -> dict:
+    """Fetch match details via the Node/steam-user GC retriever.
+
+    Valve rejects the legacy password logon that the Python steam client
+    uses (EResult.InvalidPassword since ~2026), so the Node retriever is the
+    reliable Game Coordinator path for cluster/replay_salt.
+    """
+    script_path = os.path.join(_HERE, "scripts", "gc_match_details.js")
+    if not os.path.isfile(script_path):
+        return {}
+    if not os.path.isdir(os.path.join(_HERE, "node_modules", "steam-user")):
+        return {}
+
+    env = dict(os.environ)
+    for key in ("BOT_STEAM_USERNAME", "BOT_STEAM_PASSWORD"):
+        value = get_setting(key)
+        if value:
+            env[key] = value
+    try:
+        proc = subprocess.run(
+            ["node", script_path, str(match_id)],
+            cwd=_HERE,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=55,
+        )
+    except Exception:
+        return {}
+
+    stdout = (proc.stdout or "").strip()
+    try:
+        payload = json.loads(stdout.splitlines()[-1]) if stdout else {}
+    except Exception:
+        return {}
+    if payload.get("ok") and isinstance(payload.get("match"), dict):
+        return payload["match"]
+    return {}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_gc_match_details(match_id: str) -> dict:
     username = get_setting("BOT_STEAM_USERNAME")
     password = get_setting("BOT_STEAM_PASSWORD")
     if not username or not password:
         return {}
+
+    node_match = fetch_node_gc_match_details(match_id)
+    if node_match:
+        return node_match
 
     steam_client = SteamClient()
     dota_client = Dota2Client(steam_client)
@@ -429,14 +483,15 @@ def resolve_replay_url(
     if queue_opendota_parse:
         request_opendota_parse(match_id)
 
-    replay_url = build_valve_replay_url(
+    candidate_urls = build_valve_replay_urls(
         match_id,
         match_data.get("cluster"),
         match_data.get("replay_salt"),
     )
-    if replay_url:
-        if replay_url_exists(replay_url):
-            return replay_url, "Valve CDN (via OpenDota match data)", None
+    if candidate_urls:
+        for replay_url in candidate_urls:
+            if replay_url_exists(replay_url):
+                return replay_url, "Valve CDN (via OpenDota match data)", None
         # If OpenDota already gave replay coordinates, the authenticated
         # Valve/GC fallback is very unlikely to discover a different URL; it
         # normally returns the same cluster/salt and can block for ~45s. Fail
@@ -448,14 +503,16 @@ def resolve_replay_url(
             "Replay metadata exists, but Valve CDN is not serving the replay right now. Try again later.",
         )
 
-    valve_match = fetch_valve_match_details(match_id)
-    replay_url = build_valve_replay_url(
+    # The Steam Web API never returns replay_salt, so ask the GC bot directly
+    # instead of fetch_valve_match_details (which prefers the Web API).
+    valve_match = fetch_gc_match_details(match_id)
+    for replay_url in build_valve_replay_urls(
         match_id,
         valve_match.get("cluster"),
         valve_match.get("replay_salt"),
-    )
-    if replay_url and replay_url_exists(replay_url):
-        return replay_url, "Valve CDN", None
+    ):
+        if replay_url_exists(replay_url):
+            return replay_url, "Valve CDN", None
 
     if not has_valve_fallback_credentials():
         return (
@@ -672,7 +729,7 @@ def fetch_series_matches(match: dict) -> tuple[list[dict], bool]:
         # user selects a map via process_match().
         replay_hint = bool(
             m.get("replay_url")
-            or build_valve_replay_url(
+            or build_valve_replay_urls(
                 str(m["match_id"]),
                 m.get("cluster"),
                 m.get("replay_salt"),
