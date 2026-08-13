@@ -17,8 +17,10 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -56,6 +58,15 @@ public class KillExtractor {
     // Bounty, water, and current wisdom/XP runes are not river power-rune
     // markets. Unknown future enum ids are still surfaced as rune_<id>.
     private static final Set<Integer> EXCLUDED_RUNE_TYPES = Set.of(5, 7, 8);
+    private static final Map<String, String> RUNE_MODIFIER_TYPES = Map.of(
+        "modifier_rune_doubledamage", "double_damage",
+        "modifier_rune_haste", "haste",
+        "modifier_rune_illusion", "illusion",
+        "modifier_rune_invis", "invisibility",
+        "modifier_rune_regen", "regeneration",
+        "modifier_rune_arcane", "arcane",
+        "modifier_rune_shield", "shield"
+    );
 
     // Prefer the replay entity's m_szLocation="top"/"bot" when present. The
     // coordinates are only a fallback for older schemas or missing location
@@ -69,9 +80,17 @@ public class KillExtractor {
     private static final float BOT_RUNE_X = 1180.0f;
     private static final float BOT_RUNE_Y = -1216.0f;
     private static final double MAX_POWER_RUNE_SPOT_DISTANCE = 600.0;
+    private static final int FIRST_POWER_RUNE_SPAWN_SECONDS = 360;
+    private static final int POWER_RUNE_SPAWN_INTERVAL_SECONDS = 120;
+    private static final float RUNE_RECOVERY_WINDOW_SECONDS = 3.0f;
     private static final boolean RUNE_DEBUG = "1".equals(System.getenv("RUNE_DEBUG"));
 
     private final Set<Integer> emittedRuneHandles = new HashSet<>();
+    private final Set<Integer> observedRuneSpawnSeconds = new HashSet<>();
+    // A rune bottled and used between demo snapshots may never surface as a
+    // CDOTA_Item_Rune entity. Keep tightly constrained combat-log candidates,
+    // then use them only for Spawn Times that have no entity observation.
+    private final Map<Integer, BufferedRuneFallback> runeFallbacks = new HashMap<>();
 
     public KillExtractor() {
         this.out = new PrintWriter(new OutputStreamWriter(System.out, StandardCharsets.UTF_8), true);
@@ -88,6 +107,10 @@ public class KillExtractor {
         }
     }
 
+    static record RuneFallbackCandidate(int spawnSecond, String runeType, String side, float gameTime) {}
+
+    private static record BufferedRuneFallback(RuneFallbackCandidate candidate, float rawTime) {}
+
     private void bufferEvent(float rawTime, String json) {
         buffer.add(new RawEvent(rawTime, json));
     }
@@ -95,7 +118,7 @@ public class KillExtractor {
     // ── Combat log listener ──────────────────────────────────────────────────
 
     @OnCombatLogEntry
-    public void onCombatLogEntry(CombatLogEntry cle) throws Exception {
+    public void onCombatLogEntry(Context ctx, CombatLogEntry cle) throws Exception {
 
         currentRawTime = cle.getTimestamp();
 
@@ -106,6 +129,8 @@ public class KillExtractor {
             }
             return;
         }
+
+        maybeRecoverInstantRunePickup(ctx, cle);
 
         if (cle.getType() != DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_DEATH) {
             return;
@@ -191,6 +216,85 @@ public class KillExtractor {
         ));
     }
 
+    private void maybeRecoverInstantRunePickup(Context ctx, CombatLogEntry cle) {
+        if (cle.getType() != DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_MODIFIER_ADD
+                || !cle.hasInflictorName() || !cle.hasTargetName()
+                || !RUNE_MODIFIER_TYPES.containsKey(cle.getInflictorName())) {
+            return;
+        }
+
+        Entity hero = findHeroEntity(ctx, cle.getTargetName());
+        if (hero == null) {
+            return;
+        }
+
+        Float rawX = getCoordinate(hero, "CBodyComponent.m_cellX", "CBodyComponent.m_vecX");
+        Float rawY = getCoordinate(hero, "CBodyComponent.m_cellY", "CBodyComponent.m_vecY");
+        Float worldX = rawX == null ? null : rawX - MAP_ORIGIN_OFFSET;
+        Float worldY = rawY == null ? null : rawY - MAP_ORIGIN_OFFSET;
+        float gameTime = cle.getTimestamp() - gameStartTime;
+        RuneFallbackCandidate candidate = recoverRuneFromModifier(
+            cle.getInflictorName(), gameTime, worldX, worldY
+        );
+        if (candidate == null) {
+            return;
+        }
+
+        BufferedRuneFallback fallback = new BufferedRuneFallback(candidate, cle.getTimestamp());
+        runeFallbacks.merge(candidate.spawnSecond(), fallback, (existing, replacement) -> {
+            float existingDrift = Math.abs(existing.candidate().gameTime() - existing.candidate().spawnSecond());
+            float replacementDrift = Math.abs(replacement.candidate().gameTime() - replacement.candidate().spawnSecond());
+            return replacementDrift < existingDrift ? replacement : existing;
+        });
+    }
+
+    static RuneFallbackCandidate recoverRuneFromModifier(
+            String modifierName, float gameTime, Float worldX, Float worldY) {
+        String runeType = RUNE_MODIFIER_TYPES.get(modifierName);
+        Integer spawnSecond = powerRuneSpawnSecond(gameTime);
+        if (runeType == null || spawnSecond == null) {
+            return null;
+        }
+
+        String side = classifyPowerRuneSide(null, worldX, worldY);
+        if (side == null) {
+            return null;
+        }
+        return new RuneFallbackCandidate(spawnSecond, runeType, side, gameTime);
+    }
+
+    private static Integer powerRuneSpawnSecond(float gameTime) {
+        int nearest = Math.round(gameTime / POWER_RUNE_SPAWN_INTERVAL_SECONDS)
+            * POWER_RUNE_SPAWN_INTERVAL_SECONDS;
+        if (nearest < FIRST_POWER_RUNE_SPAWN_SECONDS
+                || Math.abs(gameTime - nearest) > RUNE_RECOVERY_WINDOW_SECONDS) {
+            return null;
+        }
+        return nearest;
+    }
+
+    private static Entity findHeroEntity(Context ctx, String combatLogName) {
+        String normalizedName = normalizeHeroName(combatLogName);
+        if (normalizedName.isEmpty()) {
+            return null;
+        }
+        return ctx.getProcessor(Entities.class).getByPredicate(entity -> {
+            String dtName = entity.getDtClass().getDtName();
+            return entity.isExistent()
+                && dtName.startsWith("CDOTA_Unit_Hero_")
+                && !getBooleanProperty(entity, "m_bIsIllusion")
+                && normalizeHeroName(dtName).equals(normalizedName);
+        });
+    }
+
+    private static String normalizeHeroName(String name) {
+        return name
+            .replace("npc_dota_hero_", "")
+            .replace("CDOTA_Unit_Hero_", "")
+            .replace("_", "")
+            .toLowerCase(Locale.ROOT);
+    }
+
     // ── Entity listeners: rune spawns + Aegis pickup from hero inventory ─────
 
     @OnEntityCreated(classPattern = "CDOTA_Item_Rune")
@@ -199,7 +303,8 @@ public class KillExtractor {
     }
 
     private void maybeEmitRune(Entity e) {
-        if (!"CDOTA_Item_Rune".equals(e.getDtClass().getDtName()) || emittedRuneHandles.contains(e.getHandle())) {
+        String dtName = e.getDtClass().getDtName();
+        if (!"CDOTA_Item_Rune".equals(dtName) || emittedRuneHandles.contains(e.getHandle())) {
             return;
         }
 
@@ -236,6 +341,10 @@ public class KillExtractor {
         }
 
         emittedRuneHandles.add(e.getHandle());
+        Integer spawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
+        if (spawnSecond != null) {
+            observedRuneSpawnSeconds.add(spawnSecond);
+        }
         bufferEvent(currentRawTime, String.format(
             "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":\"%s\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
             runeTypeName, side
@@ -295,6 +404,21 @@ public class KillExtractor {
             // unavailable on this tick/entity
         }
         return null;
+    }
+
+    private static boolean getBooleanProperty(Entity e, String propertyName) {
+        try {
+            Object value = e.getProperty(propertyName);
+            if (value instanceof Boolean) {
+                return (Boolean) value;
+            }
+            if (value instanceof Number) {
+                return ((Number) value).intValue() != 0;
+            }
+        } catch (Exception ex) {
+            // unavailable on this tick/entity
+        }
+        return false;
     }
 
     private static Float getCoordinate(Entity e, String cellProperty, String vecProperty) {
@@ -383,6 +507,15 @@ public class KillExtractor {
 
     /** After replay parsing completes, apply gameStartTime offset and print all events. */
     private void flush() {
+        for (BufferedRuneFallback fallback : runeFallbacks.values()) {
+            RuneFallbackCandidate candidate = fallback.candidate();
+            if (observedRuneSpawnSeconds.add(candidate.spawnSecond())) {
+                bufferEvent(fallback.rawTime(), String.format(
+                    "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":\"%s\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
+                    candidate.runeType(), candidate.side()
+                ));
+            }
+        }
         for (RawEvent ev : buffer) {
             float gameTime = ev.rawTime - gameStartTime;
             String json = ev.jsonTemplate
