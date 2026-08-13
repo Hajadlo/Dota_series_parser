@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 import gevent
@@ -294,6 +295,47 @@ def gc_match_to_dict(match) -> dict:
     }
 
 
+# npm install is attempted at most once per process; the lock keeps parallel
+# Streamlit sessions from racing two installs into the same node_modules.
+_NODE_INSTALL_STATE = {"attempted": False}
+_NODE_INSTALL_LOCK = threading.Lock()
+
+
+def _ensure_node_gc_dependencies() -> bool:
+    """Make sure the Node GC retriever's node_modules exist, installing once.
+
+    Streamlit Cloud has no node_modules checked out (it is gitignored), but
+    packages.txt provides nodejs+npm, so the first GC use installs the two
+    runtime deps (~10-30s, once per container).
+    """
+    if os.path.isdir(os.path.join(_HERE, "node_modules", "steam-user")):
+        return True
+    if not os.path.isfile(os.path.join(_HERE, "package.json")):
+        return False
+    if shutil.which("npm") is None:
+        return False
+
+    with _NODE_INSTALL_LOCK:
+        if os.path.isdir(os.path.join(_HERE, "node_modules", "steam-user")):
+            return True
+        if _NODE_INSTALL_STATE["attempted"]:
+            return False
+        _NODE_INSTALL_STATE["attempted"] = True
+        try:
+            proc = subprocess.run(
+                ["npm", "install", "--omit=dev", "--no-audit", "--no-fund"],
+                cwd=_HERE,
+                text=True,
+                capture_output=True,
+                timeout=180,
+            )
+        except Exception:
+            return False
+        return proc.returncode == 0 and os.path.isdir(
+            os.path.join(_HERE, "node_modules", "steam-user")
+        )
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_node_gc_match_details(match_id: str) -> dict:
     """Fetch match details via the Node/steam-user GC retriever.
@@ -305,7 +347,7 @@ def fetch_node_gc_match_details(match_id: str) -> dict:
     script_path = os.path.join(_HERE, "scripts", "gc_match_details.js")
     if not os.path.isfile(script_path):
         return {}
-    if not os.path.isdir(os.path.join(_HERE, "node_modules", "steam-user")):
+    if not _ensure_node_gc_dependencies():
         return {}
 
     env = dict(os.environ)

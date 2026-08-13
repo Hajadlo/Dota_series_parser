@@ -1,1 +1,3 @@
 default-jre-headless
+nodejs
+npm
