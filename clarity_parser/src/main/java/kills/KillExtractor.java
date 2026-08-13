@@ -8,9 +8,11 @@ import skadistats.clarity.processor.entities.OnEntityCreated;
 import skadistats.clarity.processor.entities.OnEntityUpdated;
 import skadistats.clarity.processor.entities.UsesEntities;
 import skadistats.clarity.processor.gameevents.OnCombatLogEntry;
+import skadistats.clarity.processor.reader.OnMessage;
 import skadistats.clarity.processor.runner.Context;
 import skadistats.clarity.processor.runner.SimpleRunner;
 import skadistats.clarity.source.MappedFileSource;
+import skadistats.clarity.wire.dota.common.proto.DOTAUserMessages.CDOTAUserMsg_SpectatorPlayerUnitOrders;
 import skadistats.clarity.wire.dota.common.proto.DOTAUserMessages.DOTA_COMBATLOG_TYPES;
 
 import java.io.OutputStreamWriter;
@@ -85,6 +87,8 @@ public class KillExtractor {
     private static final int POWER_RUNE_SPAWN_INTERVAL_SECONDS = 120;
     private static final int POWER_RUNES_PER_CYCLE = POWER_RUNE_CYCLE_TYPES.size();
     private static final float RUNE_RECOVERY_WINDOW_SECONDS = 3.0f;
+    private static final int DOTA_UNIT_ORDER_PICKUP_RUNE = 15;
+    private static final int ENTITY_INDEX_MASK = 0x3fff;
     private static final int INVALID_ENTITY_HANDLE = 16777215;
     private static final boolean RUNE_DEBUG = "1".equals(System.getenv("RUNE_DEBUG"));
 
@@ -92,13 +96,18 @@ public class KillExtractor {
     private final Map<Integer, String> observedRuneTypesBySpawn = new HashMap<>();
     // An instantly collected Power Rune can be absent from the packet-entity
     // stream. The spectator handle plus both persistent spawner-clock updates
-    // still confirm that a spawn happened, independently of pickup/use events.
+    // still confirm that a spawn happened.
     private final Map<Integer, Float> spectatorSpawnRawTimes = new HashMap<>();
+    private final Map<Integer, Integer> spectatorRuneEntityIndexesBySpawn = new HashMap<>();
     private final Map<Integer, Set<Integer>> spawnerClockHandlesBySpawn = new HashMap<>();
     // m_nRuneCycle advances after all seven unique Power Rune types have
     // spawned. A completed cycle can therefore identify one missing type by
-    // set subtraction, while deliberately leaving its unobserved side unknown.
+    // set subtraction.
     private final Set<Integer> completedRuneCycles = new HashSet<>();
+    // A targeted PICKUP_RUNE order carries the otherwise absent rune entity's
+    // index. When it exactly matches the spectator handle, the issuing hero's
+    // replay position authoritatively identifies the river spot.
+    private final Map<RuneTarget, RunePickupOrder> runePickupOrdersByTarget = new HashMap<>();
 
     public KillExtractor() {
         this.out = new PrintWriter(new OutputStreamWriter(System.out, StandardCharsets.UTF_8), true);
@@ -114,6 +123,12 @@ public class KillExtractor {
             this.jsonTemplate = jsonTemplate;
         }
     }
+
+    static record RuneTarget(int spawnSecond, int entityIndex) {}
+
+    static record RunePickupOrder(String side, float gameTime) {}
+
+    static record RecoveredRune(String runeType, String side) {}
 
     private void bufferEvent(float rawTime, String json) {
         buffer.add(new RawEvent(rawTime, json));
@@ -226,6 +241,53 @@ public class KillExtractor {
             return null;
         }
         return nearest;
+    }
+
+    @OnMessage(CDOTAUserMsg_SpectatorPlayerUnitOrders.class)
+    public void onSpectatorPlayerUnitOrders(
+            Context ctx,
+            CDOTAUserMsg_SpectatorPlayerUnitOrders order) {
+        if (order.getOrderType() != DOTA_UNIT_ORDER_PICKUP_RUNE
+                || order.getTargetIndex() <= 0) {
+            return;
+        }
+        Integer spawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
+        if (spawnSecond == null) {
+            return;
+        }
+
+        for (int unitIndex : order.getUnitsList()) {
+            Entity unit = ctx.getProcessor(Entities.class).getByIndex(unitIndex);
+            if (unit == null || !unit.getDtClass().getDtName().startsWith("CDOTA_Unit_Hero_")) {
+                continue;
+            }
+            Float rawX = getCoordinate(unit, "CBodyComponent.m_cellX", "CBodyComponent.m_vecX");
+            Float rawY = getCoordinate(unit, "CBodyComponent.m_cellY", "CBodyComponent.m_vecY");
+            Float worldX = rawX == null ? null : rawX - MAP_ORIGIN_OFFSET;
+            Float worldY = rawY == null ? null : rawY - MAP_ORIGIN_OFFSET;
+            String side = classifyPowerRuneSide(null, worldX, worldY);
+            if (side == null) {
+                continue;
+            }
+
+            float gameTime = currentRawTime - gameStartTime;
+            RunePickupOrder candidate = new RunePickupOrder(side, gameTime);
+            runePickupOrdersByTarget.merge(
+                new RuneTarget(spawnSecond, order.getTargetIndex()),
+                candidate,
+                (previous, replacement) -> closerToSpawn(spawnSecond, previous, replacement)
+            );
+            return;
+        }
+    }
+
+    private static RunePickupOrder closerToSpawn(
+            int spawnSecond,
+            RunePickupOrder previous,
+            RunePickupOrder replacement) {
+        float previousDrift = Math.abs(previous.gameTime() - spawnSecond);
+        float replacementDrift = Math.abs(replacement.gameTime() - spawnSecond);
+        return replacementDrift < previousDrift ? replacement : previous;
     }
 
     // ── Entity listeners: rune spawns + Aegis pickup from hero inventory ─────
@@ -447,6 +509,7 @@ public class KillExtractor {
             Integer spawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
             if (handle != 0 && handle != INVALID_ENTITY_HANDLE && spawnSecond != null) {
                 spectatorSpawnRawTimes.put(spawnSecond, currentRawTime);
+                spectatorRuneEntityIndexesBySpawn.put(spawnSecond, handle & ENTITY_INDEX_MASK);
             }
         }
     }
@@ -560,6 +623,31 @@ public class KillExtractor {
         return confirmed;
     }
 
+    static Map<Integer, RecoveredRune> recoverMissingRunes(
+            Map<Integer, String> inferredRuneTypes,
+            Map<Integer, Integer> spectatorEntityIndexesBySpawn,
+            Map<RuneTarget, RunePickupOrder> pickupOrdersByTarget) {
+        Map<Integer, RecoveredRune> recovered = new TreeMap<>();
+        for (Map.Entry<Integer, String> entry : inferredRuneTypes.entrySet()) {
+            int spawnSecond = entry.getKey();
+            Integer targetIndex = spectatorEntityIndexesBySpawn.get(spawnSecond);
+            if (targetIndex == null) {
+                continue;
+            }
+            RunePickupOrder pickupOrder = pickupOrdersByTarget.get(
+                new RuneTarget(spawnSecond, targetIndex)
+            );
+            if (pickupOrder != null
+                    && (pickupOrder.side().equals("top") || pickupOrder.side().equals("bot"))) {
+                recovered.put(
+                    spawnSecond,
+                    new RecoveredRune(entry.getValue(), pickupOrder.side())
+                );
+            }
+        }
+        return recovered;
+    }
+
     // ── Flush and output ─────────────────────────────────────────────────────
 
     /** After replay parsing completes, apply gameStartTime offset and print all events. */
@@ -573,12 +661,17 @@ public class KillExtractor {
             upstreamConfirmedSpawnSeconds,
             completedRuneCycles
         );
-        for (Map.Entry<Integer, String> entry : inferredRuneTypes.entrySet()) {
+        Map<Integer, RecoveredRune> recoveredRunes = recoverMissingRunes(
+            inferredRuneTypes,
+            spectatorRuneEntityIndexesBySpawn,
+            runePickupOrdersByTarget
+        );
+        for (Map.Entry<Integer, RecoveredRune> entry : recoveredRunes.entrySet()) {
             Float rawTime = spectatorSpawnRawTimes.get(entry.getKey());
             if (rawTime != null) {
                 bufferEvent(rawTime, String.format(
-                    "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":null,\"side_status\":\"unresolved\",\"rune_source\":\"cycle_inference\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
-                    entry.getValue()
+                    "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":\"%s\",\"rune_source\":\"cycle_inference+targeted_pickup\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
+                    entry.getValue().runeType(), entry.getValue().side()
                 ));
             }
         }

@@ -31,6 +31,42 @@ class KillExtractorTest {
     }
 
     @Test
+    void resolvesRecoveredRuneOnlyFromPickupOrderTargetingExactSpectatorHandle() {
+        Map<Integer, KillExtractor.RecoveredRune> recovered = KillExtractor.recoverMissingRunes(
+            Map.of(720, "invisibility"),
+            Map.of(720, 1715),
+            Map.of(
+                new KillExtractor.RuneTarget(720, 1714),
+                new KillExtractor.RunePickupOrder("top", 720.500f),
+                new KillExtractor.RuneTarget(720, 1715),
+                new KillExtractor.RunePickupOrder("bot", 720.067f)
+            )
+        );
+
+        assertEquals(
+            Map.of(720, new KillExtractor.RecoveredRune("invisibility", "bot")),
+            recovered
+        );
+    }
+
+    @Test
+    void doesNotRecoverSideFromDifferentPickupTargetOrSpawnTime() {
+        assertEquals(
+            Map.of(),
+            KillExtractor.recoverMissingRunes(
+                Map.of(720, "invisibility"),
+                Map.of(720, 1715),
+                Map.of(
+                    new KillExtractor.RuneTarget(720, 1714),
+                    new KillExtractor.RunePickupOrder("top", 720.500f),
+                    new KillExtractor.RuneTarget(840, 1715),
+                    new KillExtractor.RunePickupOrder("bot", 840.067f)
+                )
+            )
+        );
+    }
+
+    @Test
     void requiresSpectatorHandleAndBothSpawnerClocks() {
         assertEquals(
             Set.of(),

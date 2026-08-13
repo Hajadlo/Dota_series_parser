@@ -1,15 +1,14 @@
 from dota_app import analyse_runes
 
 
-def test_cycle_inferred_rune_keeps_type_and_marks_side_unresolved():
+def test_targeted_pickup_recovered_rune_keeps_type_and_side():
     result = analyse_runes(
         [
             {
                 "type": "rune",
                 "rune_type": "invisibility",
-                "side": None,
-                "side_status": "unresolved",
-                "rune_source": "cycle_inference",
+                "side": "bot",
+                "rune_source": "cycle_inference+targeted_pickup",
                 "time_f": 720.067,
             }
         ],
@@ -18,9 +17,9 @@ def test_cycle_inferred_rune_keeps_type_and_marks_side_unresolved():
 
     spawn = next(item for item in result["spawns"] if item["minute"] == 12)
     assert spawn["rune_type"] == "invisibility"
-    assert spawn["side"] is None
-    assert spawn["rune_source"] == "cycle_inference"
-    assert result["unresolved_sides"] == [12]
+    assert spawn["side"] == "bot"
+    assert spawn["rune_source"] == "cycle_inference+targeted_pickup"
+    assert "unresolved_sides" not in result
     assert 12 not in result["unknown_gaps"]
 
 
