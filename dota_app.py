@@ -391,7 +391,16 @@ def fetch_gc_match_details(match_id: str) -> dict:
         if int(returned_match_id) == int(match_id) and not response.ready():
             response.set(("match_details", eresult, match))
 
-    login_result = steam_client.login(username, password)
+    try:
+        # login() has no overall timeout of its own: if Steam CM servers are
+        # unreachable from this host (raw TCP 27017+, which some PaaS
+        # environments block), it blocks forever inside st.cache_data and
+        # wedges every later request for the same match. All waits inside
+        # login() are gevent-cooperative, so gevent.Timeout interrupts them.
+        with gevent.Timeout(25):
+            login_result = steam_client.login(username, password)
+    except (gevent.Timeout, Exception):
+        return {}
     if login_result != EResult.OK:
         return {}
 
