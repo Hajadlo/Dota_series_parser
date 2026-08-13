@@ -1084,6 +1084,10 @@ def analyse_runes(events: list[dict], duration: int = 0) -> dict:
     Times for gap detection; when missing we fall back to the last observed rune
     event (never non-rune events — clarity emits phantom deaths post-ancient).
 
+    A cycle-inferred event has a replay-confirmed spawn and rune type but no
+    authoritative Rune Spawn Side. Its explicit `side_status="unresolved"`
+    keeps the type market usable while leaving both side selections unselected.
+
     Every observed spawn is kept — rune markets run for the whole game, with no
     upper Spawn Time bound (spawns past 40:00 are still marketed).
     """
@@ -1104,8 +1108,14 @@ def analyse_runes(events: list[dict], duration: int = 0) -> dict:
         nearest = max(RUNE_FIRST_SPAWN_SECONDS, nearest)
         drift = t - nearest
         rune_type = _normalize_rune_type(e.get("rune_type", ""))
-        side = str(e.get("side", "")).strip().lower()
-        if abs(drift) > 3 or not _is_rune_type_label(rune_type) or side not in RUNE_SIDES:
+        side = str(e.get("side") or "").strip().lower()
+        side_status = str(e.get("side_status") or "").strip().lower()
+        unresolved_side = not side and side_status == "unresolved"
+        if (
+            abs(drift) > 3
+            or not _is_rune_type_label(rune_type)
+            or (side not in RUNE_SIDES and not unresolved_side)
+        ):
             ignored.append({**e, "nearest_minute": nearest // 60, "drift": drift})
             continue
 
@@ -1113,7 +1123,9 @@ def analyse_runes(events: list[dict], duration: int = 0) -> dict:
         by_minute.setdefault(minute, []).append({
             "minute": minute,
             "rune_type": rune_type,
-            "side": side,
+            "side": None if unresolved_side else side,
+            "side_status": "unresolved" if unresolved_side else "resolved",
+            "rune_source": str(e.get("rune_source") or "entity"),
             "time_f": t,
             "drift": drift,
         })
@@ -1141,6 +1153,7 @@ def analyse_runes(events: list[dict], duration: int = 0) -> dict:
         "spawns": spawns,
         "duplicates": duplicates,
         "unknown_gaps": unknown_gaps,
+        "unresolved_sides": [spawn["minute"] for spawn in spawns if spawn["side"] is None],
         "ignored": ignored,
     }
 
@@ -2134,7 +2147,7 @@ def _rune_hint_card_row(market_label: str, entry: dict, spawn: dict) -> tuple | 
         actual = _normalize_rune_type(spawn.get("rune_type", ""))
         options = [(x, x) for x in _rune_type_options([spawn], extra=[hint] if hint else None)]
     elif market_label == "Rune Spawn Side At Time":
-        actual = str(spawn.get("side", "")).strip().lower()
+        actual = str(spawn.get("side") or "").strip().lower()
         options = [(x, x) for x in RUNE_SIDES]
     else:
         return None
@@ -2778,7 +2791,7 @@ def render_rune_markets(data: dict) -> None:
     for minute in minutes:
         spawn = by_minute.get(minute) or {}
         rune_type = str(spawn.get("rune_type", "")).strip().lower()
-        side = str(spawn.get("side", "")).strip().lower()
+        side = str(spawn.get("side") or "").strip().lower()
         label = f"{minute}m"
         type_rows.append((
             label,
@@ -2803,6 +2816,13 @@ def render_rune_markets(data: dict) -> None:
         warnings = []
         if gaps:
             warnings.append("missing observed spawn for " + ", ".join(f"{int(minute)}m" for minute in gaps))
+        unresolved_sides = rune_data.get("unresolved_sides") or []
+        if unresolved_sides:
+            warnings.append(
+                "spawn side unavailable for "
+                + ", ".join(f"{int(minute)}m" for minute in unresolved_sides)
+                + " (type recovered from the completed replay rune cycle)"
+            )
         duplicates = rune_data.get("duplicates") or []
         if duplicates:
             warnings.append(

@@ -20,9 +20,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 @UsesEntities
 public class KillExtractor {
@@ -58,14 +59,14 @@ public class KillExtractor {
     // Bounty, water, and current wisdom/XP runes are not river power-rune
     // markets. Unknown future enum ids are still surfaced as rune_<id>.
     private static final Set<Integer> EXCLUDED_RUNE_TYPES = Set.of(5, 7, 8);
-    private static final Map<String, String> RUNE_MODIFIER_TYPES = Map.of(
-        "modifier_rune_doubledamage", "double_damage",
-        "modifier_rune_haste", "haste",
-        "modifier_rune_illusion", "illusion",
-        "modifier_rune_invis", "invisibility",
-        "modifier_rune_regen", "regeneration",
-        "modifier_rune_arcane", "arcane",
-        "modifier_rune_shield", "shield"
+    private static final Set<String> POWER_RUNE_CYCLE_TYPES = Set.of(
+        "arcane",
+        "double_damage",
+        "haste",
+        "illusion",
+        "invisibility",
+        "regeneration",
+        "shield"
     );
 
     // Prefer the replay entity's m_szLocation="top"/"bot" when present. The
@@ -82,15 +83,22 @@ public class KillExtractor {
     private static final double MAX_POWER_RUNE_SPOT_DISTANCE = 600.0;
     private static final int FIRST_POWER_RUNE_SPAWN_SECONDS = 360;
     private static final int POWER_RUNE_SPAWN_INTERVAL_SECONDS = 120;
+    private static final int POWER_RUNES_PER_CYCLE = POWER_RUNE_CYCLE_TYPES.size();
     private static final float RUNE_RECOVERY_WINDOW_SECONDS = 3.0f;
+    private static final int INVALID_ENTITY_HANDLE = 16777215;
     private static final boolean RUNE_DEBUG = "1".equals(System.getenv("RUNE_DEBUG"));
 
     private final Set<Integer> emittedRuneHandles = new HashSet<>();
-    private final Set<Integer> observedRuneSpawnSeconds = new HashSet<>();
-    // A rune bottled and used between demo snapshots may never surface as a
-    // CDOTA_Item_Rune entity. Keep tightly constrained combat-log candidates,
-    // then use them only for Spawn Times that have no entity observation.
-    private final Map<Integer, BufferedRuneFallback> runeFallbacks = new HashMap<>();
+    private final Map<Integer, String> observedRuneTypesBySpawn = new HashMap<>();
+    // An instantly collected Power Rune can be absent from the packet-entity
+    // stream. The spectator handle plus both persistent spawner-clock updates
+    // still confirm that a spawn happened, independently of pickup/use events.
+    private final Map<Integer, Float> spectatorSpawnRawTimes = new HashMap<>();
+    private final Map<Integer, Set<Integer>> spawnerClockHandlesBySpawn = new HashMap<>();
+    // m_nRuneCycle advances after all seven unique Power Rune types have
+    // spawned. A completed cycle can therefore identify one missing type by
+    // set subtraction, while deliberately leaving its unobserved side unknown.
+    private final Set<Integer> completedRuneCycles = new HashSet<>();
 
     public KillExtractor() {
         this.out = new PrintWriter(new OutputStreamWriter(System.out, StandardCharsets.UTF_8), true);
@@ -107,10 +115,6 @@ public class KillExtractor {
         }
     }
 
-    static record RuneFallbackCandidate(int spawnSecond, String runeType, String side, float gameTime) {}
-
-    private static record BufferedRuneFallback(RuneFallbackCandidate candidate, float rawTime) {}
-
     private void bufferEvent(float rawTime, String json) {
         buffer.add(new RawEvent(rawTime, json));
     }
@@ -118,7 +122,7 @@ public class KillExtractor {
     // ── Combat log listener ──────────────────────────────────────────────────
 
     @OnCombatLogEntry
-    public void onCombatLogEntry(Context ctx, CombatLogEntry cle) throws Exception {
+    public void onCombatLogEntry(CombatLogEntry cle) throws Exception {
 
         currentRawTime = cle.getTimestamp();
 
@@ -129,8 +133,6 @@ public class KillExtractor {
             }
             return;
         }
-
-        maybeRecoverInstantRunePickup(ctx, cle);
 
         if (cle.getType() != DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_DEATH) {
             return;
@@ -216,53 +218,6 @@ public class KillExtractor {
         ));
     }
 
-    private void maybeRecoverInstantRunePickup(Context ctx, CombatLogEntry cle) {
-        if (cle.getType() != DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_MODIFIER_ADD
-                || !cle.hasInflictorName() || !cle.hasTargetName()
-                || !RUNE_MODIFIER_TYPES.containsKey(cle.getInflictorName())) {
-            return;
-        }
-
-        Entity hero = findHeroEntity(ctx, cle.getTargetName());
-        if (hero == null) {
-            return;
-        }
-
-        Float rawX = getCoordinate(hero, "CBodyComponent.m_cellX", "CBodyComponent.m_vecX");
-        Float rawY = getCoordinate(hero, "CBodyComponent.m_cellY", "CBodyComponent.m_vecY");
-        Float worldX = rawX == null ? null : rawX - MAP_ORIGIN_OFFSET;
-        Float worldY = rawY == null ? null : rawY - MAP_ORIGIN_OFFSET;
-        float gameTime = cle.getTimestamp() - gameStartTime;
-        RuneFallbackCandidate candidate = recoverRuneFromModifier(
-            cle.getInflictorName(), gameTime, worldX, worldY
-        );
-        if (candidate == null) {
-            return;
-        }
-
-        BufferedRuneFallback fallback = new BufferedRuneFallback(candidate, cle.getTimestamp());
-        runeFallbacks.merge(candidate.spawnSecond(), fallback, (existing, replacement) -> {
-            float existingDrift = Math.abs(existing.candidate().gameTime() - existing.candidate().spawnSecond());
-            float replacementDrift = Math.abs(replacement.candidate().gameTime() - replacement.candidate().spawnSecond());
-            return replacementDrift < existingDrift ? replacement : existing;
-        });
-    }
-
-    static RuneFallbackCandidate recoverRuneFromModifier(
-            String modifierName, float gameTime, Float worldX, Float worldY) {
-        String runeType = RUNE_MODIFIER_TYPES.get(modifierName);
-        Integer spawnSecond = powerRuneSpawnSecond(gameTime);
-        if (runeType == null || spawnSecond == null) {
-            return null;
-        }
-
-        String side = classifyPowerRuneSide(null, worldX, worldY);
-        if (side == null) {
-            return null;
-        }
-        return new RuneFallbackCandidate(spawnSecond, runeType, side, gameTime);
-    }
-
     private static Integer powerRuneSpawnSecond(float gameTime) {
         int nearest = Math.round(gameTime / POWER_RUNE_SPAWN_INTERVAL_SECONDS)
             * POWER_RUNE_SPAWN_INTERVAL_SECONDS;
@@ -271,28 +226,6 @@ public class KillExtractor {
             return null;
         }
         return nearest;
-    }
-
-    private static Entity findHeroEntity(Context ctx, String combatLogName) {
-        String normalizedName = normalizeHeroName(combatLogName);
-        if (normalizedName.isEmpty()) {
-            return null;
-        }
-        return ctx.getProcessor(Entities.class).getByPredicate(entity -> {
-            String dtName = entity.getDtClass().getDtName();
-            return entity.isExistent()
-                && dtName.startsWith("CDOTA_Unit_Hero_")
-                && !getBooleanProperty(entity, "m_bIsIllusion")
-                && normalizeHeroName(dtName).equals(normalizedName);
-        });
-    }
-
-    private static String normalizeHeroName(String name) {
-        return name
-            .replace("npc_dota_hero_", "")
-            .replace("CDOTA_Unit_Hero_", "")
-            .replace("_", "")
-            .toLowerCase(Locale.ROOT);
     }
 
     // ── Entity listeners: rune spawns + Aegis pickup from hero inventory ─────
@@ -335,16 +268,17 @@ public class KillExtractor {
             return;
         }
 
+        Integer spawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
+        if (spawnSecond != null) {
+            observedRuneTypesBySpawn.putIfAbsent(spawnSecond, runeTypeName);
+        }
+
         String side = classifyPowerRuneSide(location, worldX, worldY);
         if (side == null) {
             return;
         }
 
         emittedRuneHandles.add(e.getHandle());
-        Integer spawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
-        if (spawnSecond != null) {
-            observedRuneSpawnSeconds.add(spawnSecond);
-        }
         bufferEvent(currentRawTime, String.format(
             "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":\"%s\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
             runeTypeName, side
@@ -406,21 +340,6 @@ public class KillExtractor {
         return null;
     }
 
-    private static boolean getBooleanProperty(Entity e, String propertyName) {
-        try {
-            Object value = e.getProperty(propertyName);
-            if (value instanceof Boolean) {
-                return (Boolean) value;
-            }
-            if (value instanceof Number) {
-                return ((Number) value).intValue() != 0;
-            }
-        } catch (Exception ex) {
-            // unavailable on this tick/entity
-        }
-        return false;
-    }
-
     private static Float getCoordinate(Entity e, String cellProperty, String vecProperty) {
         Integer cell = getIntegerProperty(e, cellProperty);
         Float vec = getFloatProperty(e, vecProperty);
@@ -440,6 +359,13 @@ public class KillExtractor {
     @OnEntityUpdated
     public void onEntityUpdated(Context ctx, Entity e, FieldPath[] updatedPaths, int updateCount) {
         String dtName = e.getDtClass().getDtName();
+        if ("CDOTA_DataSpectator".equals(dtName)) {
+            recordSpectatorSpawnSignal(e, updatedPaths, updateCount);
+        } else if ("CDOTA_Item_RuneSpawner_Powerup".equals(dtName)) {
+            recordSpawnerClockSignal(e, updatedPaths, updateCount);
+        } else if ("CDOTAGamerulesProxy".equals(dtName)) {
+            recordCompletedRuneCycle(e, updatedPaths, updateCount);
+        }
         if ("CDOTA_Item_Rune".equals(dtName)) {
             maybeEmitRune(e);
             return;
@@ -503,16 +429,156 @@ public class KillExtractor {
         }
     }
 
+    private void recordSpectatorSpawnSignal(Entity entity, FieldPath[] updatedPaths, int updateCount) {
+        for (int i = 0; i < updateCount; i++) {
+            if (!"m_hPowerupRune_1".equals(fieldName(entity, updatedPaths[i]))) {
+                continue;
+            }
+            Object value;
+            try {
+                value = entity.getPropertyForFieldPath(updatedPaths[i]);
+            } catch (Exception ex) {
+                continue;
+            }
+            if (!(value instanceof Number)) {
+                continue;
+            }
+            int handle = ((Number) value).intValue();
+            Integer spawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
+            if (handle != 0 && handle != INVALID_ENTITY_HANDLE && spawnSecond != null) {
+                spectatorSpawnRawTimes.put(spawnSecond, currentRawTime);
+            }
+        }
+    }
+
+    private void recordSpawnerClockSignal(Entity entity, FieldPath[] updatedPaths, int updateCount) {
+        boolean clockUpdated = false;
+        for (int i = 0; i < updateCount; i++) {
+            String name = fieldName(entity, updatedPaths[i]);
+            if ("m_flLastSpawnTime".equals(name) || "m_flNextSpawnTime".equals(name)) {
+                clockUpdated = true;
+                break;
+            }
+        }
+        Integer spawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
+        if (clockUpdated && spawnSecond != null) {
+            spawnerClockHandlesBySpawn
+                .computeIfAbsent(spawnSecond, ignored -> new HashSet<>())
+                .add(entity.getHandle());
+        }
+    }
+
+    private void recordCompletedRuneCycle(Entity entity, FieldPath[] updatedPaths, int updateCount) {
+        for (int i = 0; i < updateCount; i++) {
+            if (!"m_pGameRules.m_nRuneCycle".equals(fieldName(entity, updatedPaths[i]))) {
+                continue;
+            }
+            Object value;
+            try {
+                value = entity.getPropertyForFieldPath(updatedPaths[i]);
+            } catch (Exception ex) {
+                continue;
+            }
+            if (!(value instanceof Number)) {
+                continue;
+            }
+            int completedCycle = ((Number) value).intValue() - 1;
+            int expectedEndSecond = cycleStartSecond(completedCycle)
+                + (POWER_RUNES_PER_CYCLE - 1) * POWER_RUNE_SPAWN_INTERVAL_SECONDS;
+            Integer currentSpawnSecond = powerRuneSpawnSecond(currentRawTime - gameStartTime);
+            if (completedCycle >= 0 && currentSpawnSecond != null
+                    && currentSpawnSecond == expectedEndSecond) {
+                completedRuneCycles.add(completedCycle);
+            }
+        }
+    }
+
+    private static String fieldName(Entity entity, FieldPath fieldPath) {
+        try {
+            return entity.getDtClass().getNameForFieldPath(fieldPath);
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    private static int cycleStartSecond(int cycleIndex) {
+        return FIRST_POWER_RUNE_SPAWN_SECONDS
+            + cycleIndex * POWER_RUNES_PER_CYCLE * POWER_RUNE_SPAWN_INTERVAL_SECONDS;
+    }
+
+    static Map<Integer, String> inferMissingRuneTypes(
+            Map<Integer, String> observedTypesBySpawn,
+            Set<Integer> upstreamConfirmedSpawnSeconds,
+            Set<Integer> completedCycles) {
+        Map<Integer, String> inferred = new TreeMap<>();
+        for (int cycleIndex : new TreeSet<>(completedCycles)) {
+            if (cycleIndex < 0) {
+                continue;
+            }
+            Set<String> observedTypes = new HashSet<>();
+            List<Integer> missingSpawns = new ArrayList<>();
+            boolean containsUnknownType = false;
+            int cycleStart = cycleStartSecond(cycleIndex);
+            for (int offset = 0; offset < POWER_RUNES_PER_CYCLE; offset++) {
+                int spawnSecond = cycleStart + offset * POWER_RUNE_SPAWN_INTERVAL_SECONDS;
+                String runeType = observedTypesBySpawn.get(spawnSecond);
+                if (runeType == null) {
+                    missingSpawns.add(spawnSecond);
+                } else if (!POWER_RUNE_CYCLE_TYPES.contains(runeType)) {
+                    containsUnknownType = true;
+                } else {
+                    observedTypes.add(runeType);
+                }
+            }
+            if (containsUnknownType || missingSpawns.size() != 1
+                    || observedTypes.size() != POWER_RUNES_PER_CYCLE - 1) {
+                continue;
+            }
+            int missingSpawn = missingSpawns.get(0);
+            if (!upstreamConfirmedSpawnSeconds.contains(missingSpawn)) {
+                continue;
+            }
+            Set<String> remainingTypes = new HashSet<>(POWER_RUNE_CYCLE_TYPES);
+            remainingTypes.removeAll(observedTypes);
+            if (remainingTypes.size() == 1) {
+                inferred.put(missingSpawn, remainingTypes.iterator().next());
+            }
+        }
+        return inferred;
+    }
+
+    static Set<Integer> confirmUpstreamSpawnSeconds(
+            Set<Integer> spectatorSpawnSeconds,
+            Map<Integer, Set<Integer>> spawnerHandlesBySpawn) {
+        Set<Integer> confirmed = new TreeSet<>();
+        for (int spawnSecond : spectatorSpawnSeconds) {
+            Set<Integer> spawnerHandles = spawnerHandlesBySpawn.get(spawnSecond);
+            if (spawnerHandles != null && spawnerHandles.size() >= 2) {
+                confirmed.add(spawnSecond);
+            }
+        }
+        return confirmed;
+    }
+
     // ── Flush and output ─────────────────────────────────────────────────────
 
     /** After replay parsing completes, apply gameStartTime offset and print all events. */
     private void flush() {
-        for (BufferedRuneFallback fallback : runeFallbacks.values()) {
-            RuneFallbackCandidate candidate = fallback.candidate();
-            if (observedRuneSpawnSeconds.add(candidate.spawnSecond())) {
-                bufferEvent(fallback.rawTime(), String.format(
-                    "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":\"%s\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
-                    candidate.runeType(), candidate.side()
+        Set<Integer> upstreamConfirmedSpawnSeconds = confirmUpstreamSpawnSeconds(
+            spectatorSpawnRawTimes.keySet(),
+            spawnerClockHandlesBySpawn
+        );
+        Map<Integer, String> inferredRuneTypes = inferMissingRuneTypes(
+            observedRuneTypesBySpawn,
+            upstreamConfirmedSpawnSeconds,
+            completedRuneCycles
+        );
+        for (Map.Entry<Integer, String> entry : inferredRuneTypes.entrySet()) {
+            Float rawTime = spectatorSpawnRawTimes.get(entry.getKey());
+            if (rawTime != null) {
+                bufferEvent(rawTime, String.format(
+                    "{\"type\":\"rune\",\"rune_type\":\"%s\",\"side\":null,\"side_status\":\"unresolved\",\"rune_source\":\"cycle_inference\",\"time\":%%TIME%%,\"time_f\":%%TIMEF%%}",
+                    entry.getValue()
                 ));
             }
         }

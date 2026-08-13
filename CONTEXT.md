@@ -16,6 +16,8 @@ _Avoid_: rune (unqualified), powerup rune
 **Rune Spawn Side**:
 The river power-rune spot where a Power Rune appears: `top` or `bot`. Map-absolute —
 independent of Home/Away and of Radiant/Dire.
+If the replay confirms a spawn and its type but never exposes the spawned rune
+entity, leave the side unresolved; never infer it from a nearby hero or pickup/use.
 _Avoid_: bottom, Radiant side, Dire side
 
 **Spawn Time**:
